@@ -112,94 +112,41 @@ impl LaunchEnv {
         let entries =
             fs::read_dir(path).map_err(|e| format!("List env dir '{}': {}", env_dir, e))?;
 
-        // Go reads directories in sorted order
-        let mut files = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let ftype = entry.file_type().map_err(|e| e.to_string())?;
-            if ftype.is_dir() {
-                continue;
-            }
-            // Dereference symlinks to check if they point to directories
-            if ftype.is_symlink() {
-                if let Ok(metadata) = fs::metadata(entry.path()) {
-                    if metadata.is_dir() {
-                        continue;
-                    }
+        let mut files: Vec<_> = entries
+            .filter_map(|entry_res| {
+                let entry = match entry_res {
+                    Ok(e) => e,
+                    Err(err) => return Some(Err(err.to_string())),
+                };
+                match fs::metadata(entry.path()) {
+                    Ok(meta) if meta.is_dir() => None,
+                    Ok(_) => Some(Ok(entry)),
+                    Err(_) => None,
                 }
-            }
-            files.push(entry);
-        }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         files.sort_by_key(|f| f.file_name());
 
         for file in files {
             let file_name = file.file_name().to_string_lossy().into_owned();
+            let Some((name, action)) = parse_env_file_parts(&file_name, default_action) else {
+                continue;
+            };
             let file_path = file.path();
 
-            // Suffix parsing
-            let parts: Vec<&str> = file_name.splitn(2, '.').collect();
-            let name = parts[0].to_string();
-            let suffix = if parts.len() > 1 { parts[1] } else { "" };
-
-            // Delimiter files are ignored in the main action loop
-            if suffix == "delim" {
-                continue;
-            }
-
-            let action = match suffix {
-                "override" => ActionType::Override,
-                "default" => ActionType::Default,
-                "append" => ActionType::Append,
-                "prepend" => ActionType::Prepend,
-                "" => default_action,
-                _ => continue, // Ignore files with unknown suffixes
-            };
-
-            let raw_val = fs::read_to_string(&file_path)
+            let v = fs::read_to_string(&file_path)
                 .map_err(|e| format!("Read env file '{}': {}", file_path.display(), e))?;
 
-            // Spec: File contents must not contain leading/trailing whitespaces trimmed
-            // (or rather, "file contents MUST NOT be evaluated by a shell or otherwise modified")
-            let v = raw_val;
+            // Read custom delimiter if present
+            let delim_path = Path::new(env_dir).join(format!("{}.delim", name));
+            let delim = if delim_path.is_file() {
+                fs::read_to_string(&delim_path).ok()
+            } else {
+                None
+            };
 
-            let current = self.vars.get(&name).cloned().unwrap_or_default();
-
-            match action {
-                ActionType::Override => {
-                    self.vars.insert(name, v);
-                }
-                ActionType::Default => {
-                    if current.is_empty() {
-                        self.vars.insert(name, v);
-                    }
-                }
-                ActionType::Append => {
-                    let d = get_delim(env_dir, &name, "");
-                    let new_val = if current.is_empty() {
-                        v
-                    } else {
-                        format!("{}{}{}", current, d, v)
-                    };
-                    self.vars.insert(name, new_val);
-                }
-                ActionType::Prepend => {
-                    // Path prepending is mapped under unsuffixed env directories which resolves to PrependPath in Go.
-                    // If name is a root env variable (like PATH), default delimiter is PATH separator.
-                    let is_path_var = name == "PATH" || name == "LD_LIBRARY_PATH";
-                    let default_delim = if is_path_var {
-                        if cfg!(windows) { ";" } else { ":" }
-                    } else {
-                        ""
-                    };
-
-                    let d = get_delim(env_dir, &name, default_delim);
-                    let new_val = if current.is_empty() {
-                        v
-                    } else {
-                        format!("{}{}{}", v, d, current)
-                    };
-                    self.vars.insert(name, new_val);
-                }
+            if let Some(new_val) = self.evaluate_env_modifier(&name, action, v, delim.as_deref()) {
+                self.vars.insert(name, new_val);
             }
         }
         Ok(())
@@ -209,16 +156,66 @@ impl LaunchEnv {
     pub fn vars(&self) -> &HashMap<String, String> {
         &self.vars
     }
+
+    fn evaluate_env_modifier(&self, name: &str, action: ActionType, v: String, delim: Option<&str>) -> Option<String> {
+        let current = self.vars.get(name).cloned().unwrap_or_default();
+        match action {
+            ActionType::Override => Some(v),
+            ActionType::Default => {
+                if current.is_empty() {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            ActionType::Append => {
+                let d = delim.unwrap_or("");
+                let new_val = if current.is_empty() {
+                    v
+                } else {
+                    format!("{}{}{}", current, d, v)
+                };
+                Some(new_val)
+            }
+            ActionType::Prepend => {
+                let d = delim.unwrap_or_else(|| {
+                    if name == "PATH" || name == "LD_LIBRARY_PATH" {
+                        if cfg!(windows) { ";" } else { ":" }
+                    } else {
+                        ""
+                    }
+                });
+                let new_val = if current.is_empty() {
+                    v
+                } else {
+                    format!("{}{}{}", v, d, current)
+                };
+                Some(new_val)
+            }
+        }
+    }
 }
 
+fn parse_env_file_parts(file_name: &str, default_action: ActionType) -> Option<(String, ActionType)> {
+    let parts: Vec<&str> = file_name.splitn(2, '.').collect();
+    let name = parts[0].to_string();
+    let suffix = if parts.len() > 1 { parts[1] } else { "" };
 
-fn get_delim(dir: &str, name: &str, default_delim: &str) -> String {
-    let delim_path = Path::new(dir).join(format!("{}.delim", name));
-    if delim_path.is_file() {
-        fs::read_to_string(&delim_path).unwrap_or_else(|_| default_delim.to_string())
-    } else {
-        default_delim.to_string()
+    // Delimiter files are ignored in the main action loop
+    if suffix == "delim" {
+        return None;
     }
+
+    let action = match suffix {
+        "override" => ActionType::Override,
+        "default" => ActionType::Default,
+        "append" => ActionType::Append,
+        "prepend" => ActionType::Prepend,
+        "" => default_action,
+        _ => return None, // Ignore files with unknown suffixes
+    };
+
+    Some((name, action))
 }
 
 #[cfg(test)]
@@ -297,5 +294,102 @@ mod tests {
         assert_eq!(env.get("PATH").unwrap(), "/layer/bin:/usr/bin");
         // VAR uses custom delimiter "-"
         assert_eq!(env.get("VAR").unwrap(), "base-appendage");
+    }
+
+    #[test]
+    fn test_parse_env_file_parts() {
+        use super::{parse_env_file_parts, ActionType};
+
+        // Valid suffixes
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.override", ActionType::Default),
+            Some(("MY_VAR".to_string(), ActionType::Override))
+        );
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.default", ActionType::Override),
+            Some(("MY_VAR".to_string(), ActionType::Default))
+        );
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.append", ActionType::Override),
+            Some(("MY_VAR".to_string(), ActionType::Append))
+        );
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.prepend", ActionType::Override),
+            Some(("MY_VAR".to_string(), ActionType::Prepend))
+        );
+
+        // Unsuffixed file uses the default action
+        assert_eq!(
+            parse_env_file_parts("MY_VAR", ActionType::Default),
+            Some(("MY_VAR".to_string(), ActionType::Default))
+        );
+
+        // Multiple periods (spec compliance: split on the first period)
+        // Suffix is "name.override" (unknown) -> ignored (returns None)
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.name.override", ActionType::Default),
+            None
+        );
+
+        // Delimiter files -> ignored (returns None)
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.delim", ActionType::Default),
+            None
+        );
+
+        // Unknown suffix -> ignored (returns None)
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.invalid_suffix", ActionType::Default),
+            None
+        );
+    }
+
+    #[test]
+    fn test_evaluate_env_modifier() {
+        use super::{LaunchEnv, ActionType};
+
+        let env = LaunchEnv::new(&[], "", "");
+
+        // 1. Override
+        assert_eq!(
+            env.evaluate_env_modifier("FOO", ActionType::Override, "val1".to_string(), None),
+            Some("val1".to_string())
+        );
+
+        // 2. Default
+        // When empty -> Some
+        assert_eq!(
+            env.evaluate_env_modifier("BAR", ActionType::Default, "val1".to_string(), None),
+            Some("val1".to_string())
+        );
+
+        // When not empty -> None
+        let mut env_with_val = LaunchEnv::new(&[], "", "");
+        env_with_val.set("BAR", "val1");
+        assert_eq!(
+            env_with_val.evaluate_env_modifier("BAR", ActionType::Default, "val2".to_string(), None),
+            None
+        );
+
+        // 3. Append (default no delimiter)
+        assert_eq!(
+            env_with_val.evaluate_env_modifier("BAR", ActionType::Append, "val2".to_string(), None),
+            Some("val1val2".to_string())
+        );
+
+        // 4. Append with custom delimiter
+        assert_eq!(
+            env_with_val.evaluate_env_modifier("BAR", ActionType::Append, "val3".to_string(), Some("-")),
+            Some("val1-val3".to_string())
+        );
+
+        // 5. Prepend path variable (uses default separator)
+        let mut env_with_path = LaunchEnv::new(&[], "", "");
+        env_with_path.set("PATH", "/usr/bin");
+        let expected = if cfg!(windows) { "/bin;/usr/bin" } else { "/bin:/usr/bin" };
+        assert_eq!(
+            env_with_path.evaluate_env_modifier("PATH", ActionType::Prepend, "/bin".to_string(), None),
+            Some(expected.to_string())
+        );
     }
 }
