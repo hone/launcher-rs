@@ -15,6 +15,20 @@ pub enum ActionType {
     Prepend,
 }
 
+impl std::str::FromStr for ActionType {
+    type Err = ();
+
+    fn from_str(suffix: &str) -> Result<Self, Self::Err> {
+        match suffix {
+            "override" => Ok(ActionType::Override),
+            "default" => Ok(ActionType::Default),
+            "append" => Ok(ActionType::Append),
+            "prepend" => Ok(ActionType::Prepend),
+            _ => Err(()),
+        }
+    }
+}
+
 /// The list of environment variables that are explicitly excluded from leaking into the final launch process environment.
 pub const LAUNCH_ENV_EXCLUDELIST: &[&str] = &[
     "CNB_LAYERS_DIR",
@@ -207,12 +221,8 @@ fn parse_env_file_parts(file_name: &str, default_action: ActionType) -> Option<(
     }
 
     let action = match suffix {
-        "override" => ActionType::Override,
-        "default" => ActionType::Default,
-        "append" => ActionType::Append,
-        "prepend" => ActionType::Prepend,
         "" => default_action,
-        _ => return None, // Ignore files with unknown suffixes
+        other => other.parse().ok()?,
     };
 
     Some((name, action))
