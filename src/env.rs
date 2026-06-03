@@ -285,11 +285,13 @@ mod tests {
 
     #[test]
     fn test_new_launch_env_purging_and_sanitization() {
+        let path_val = if cfg!(windows) {
+            "/lifecycle;/process;/usr/bin"
+        } else {
+            "/lifecycle:/process:/usr/bin"
+        };
         let host_env = vec![
-            (
-                "PATH".to_string(),
-                "/lifecycle:/process:/usr/bin".to_string(),
-            ),
+            ("PATH".to_string(), path_val.to_string()),
             ("CNB_APP_DIR".to_string(), "/workspace".to_string()),
             ("FOO".to_string(), "bar".to_string()),
         ];
@@ -347,8 +349,13 @@ mod tests {
 
         env.add_env_dir(dir_path, ActionType::Override).unwrap();
 
-        // PATH uses default separator (":" on unix)
-        assert_eq!(env.get("PATH").unwrap(), "/layer/bin:/usr/bin");
+        // PATH uses default separator (":" on unix, ";" on windows)
+        let expected_path = if cfg!(windows) {
+            "/layer/bin;/usr/bin"
+        } else {
+            "/layer/bin:/usr/bin"
+        };
+        assert_eq!(env.get("PATH").unwrap(), expected_path);
         // VAR uses custom delimiter "-"
         assert_eq!(env.get("VAR").unwrap(), "base-appendage");
     }
