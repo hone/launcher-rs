@@ -268,25 +268,23 @@ impl<'a> ProcessSelector<'a> {
         };
 
         // Rule 1: argv0 matches a process type (e.g. symlink)
-        if process_name != "launcher" {
-            if let Some(raw_proc) = self
-                .metadata
-                .processes
-                .iter()
-                .find(|p| p.proc_type == process_name)
-            {
-                return resolve_process(
-                    raw_proc,
-                    &self.metadata.buildpacks,
-                    self.platform_api,
-                    self.exec_env,
-                    &user_args,
-                )?
-                .ok_or_else(|| ProcessSelectionError::IneligibleProcess {
-                    name: process_name.clone(),
-                    exec_env: self.exec_env.to_string(),
-                });
-            }
+        let raw_proc_opt = if process_name != "launcher" {
+            self.metadata.processes.iter().find(|p| p.proc_type == process_name)
+        } else {
+            None
+        };
+        if let Some(raw_proc) = raw_proc_opt {
+            return resolve_process(
+                raw_proc,
+                &self.metadata.buildpacks,
+                self.platform_api,
+                self.exec_env,
+                &user_args,
+            )?
+            .ok_or_else(|| ProcessSelectionError::IneligibleProcess {
+                name: process_name.clone(),
+                exec_env: self.exec_env.to_string(),
+            });
         }
 
         if user_args.is_empty() {
@@ -299,7 +297,7 @@ impl<'a> ProcessSelector<'a> {
                     self.exec_env,
                     &[],
                 )?
-                .ok_or_else(|| ProcessSelectionError::IneligibleDefault);
+                .ok_or(ProcessSelectionError::IneligibleDefault);
             }
             return Err(ProcessSelectionError::NoCommandAndNoDefault);
         }
@@ -338,15 +336,14 @@ pub fn resolve_process(
     user_args: &[String],
 ) -> Result<Option<ResolvedProcess>, ProcessSelectionError> {
     // 1. Check eligibility (Platform API >= 0.15)
-    if platform_api.at_least("0.15") {
-        if let Some(ref envs) = raw.exec_env {
-            if !envs.is_empty()
+    if platform_api.at_least("0.15")
+        && raw.exec_env.as_ref().is_some_and(|envs| {
+            !envs.is_empty()
                 && !envs.contains(&"*".to_string())
                 && !envs.contains(&exec_env.to_string())
-            {
-                return Ok(None); // Ineligible
-            }
-        }
+        })
+    {
+        return Ok(None); // Ineligible
     }
 
     // 2. Find buildpack and verify buildpack API

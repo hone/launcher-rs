@@ -41,10 +41,11 @@ pub const CNB_LIFECYCLE_DIR: &str = "/cnb/lifecycle";
 pub const CNB_LIFECYCLE_DIR: &str = "c:\\cnb\\lifecycle";
 
 fn should_enable_color() -> bool {
-    if let Ok(no_color) = std::env::var("CNB_NO_COLOR") {
-        if no_color.trim().to_lowercase() == "true" {
-            return false;
-        }
+    if std::env::var("CNB_NO_COLOR")
+        .map(|v| v.trim().to_lowercase() == "true")
+        .unwrap_or(false)
+    {
+        return false;
     }
     std::io::stderr().is_terminal()
 }
@@ -93,9 +94,9 @@ pub enum LaunchError {
         bp_id: String,
         error: api::buildpack::BuildpackApiError,
     },
-    LaunchEnv(env::LaunchEnvError),
-    ExecD(exec_d::ExecDError),
-    ProcessSelection(launch::ProcessSelectionError),
+    LaunchEnv(Box<env::LaunchEnvError>),
+    ExecD(Box<exec_d::ExecDError>),
+    ProcessSelection(Box<launch::ProcessSelectionError>),
     MetadataNotFound {
         path: String,
     },
@@ -175,9 +176,12 @@ impl LaunchError {
         match self {
             LaunchError::PlatformApi(_) => ExitCode::PlatformApiIncompatible,
             LaunchError::SetBuildpackApi { .. } => ExitCode::BuildpackApiIncompatible,
-            LaunchError::ProcessSelection(launch::ProcessSelectionError::BuildpackApi(_)) => {
-                ExitCode::BuildpackApiIncompatible
-            }
+            LaunchError::ProcessSelection(err) => match &**err {
+                launch::ProcessSelectionError::BuildpackApi(_) => {
+                    ExitCode::BuildpackApiIncompatible
+                }
+                _ => ExitCode::LaunchError,
+            },
             _ => ExitCode::LaunchError,
         }
     }
@@ -256,22 +260,25 @@ fn run_launcher() -> Result<(), LaunchError> {
         argv0_file_name
     };
 
-    if process_name == "launcher" {
-        if let Ok(p_type) = std::env::var("CNB_PROCESS_TYPE") {
-            if !p_type.trim().is_empty() {
-                print_warning(&format!(
-                    "CNB_PROCESS_TYPE is not supported in Platform API {}",
-                    platform_api
-                ));
-                print_warning(&format!(
-                    "Run with ENTRYPOINT '{}' to invoke the '{}' process type",
-                    p_type, p_type
-                ));
-            }
-        }
+    let p_type_opt = if process_name == "launcher" {
+        std::env::var("CNB_PROCESS_TYPE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    } else {
+        None
+    };
+    if let Some(p_type) = p_type_opt {
+        print_warning(&format!(
+            "CNB_PROCESS_TYPE is not supported in Platform API {}",
+            platform_api
+        ));
+        print_warning(&format!(
+            "Run with ENTRYPOINT '{}' to invoke the '{}' process type",
+            p_type, p_type
+        ));
     }
 
-    let resolved_process = selector.select().map_err(LaunchError::ProcessSelection)?;
+    let resolved_process = selector.select().map_err(|e| LaunchError::ProcessSelection(Box::new(e)))?;
 
     // 8. Prepare Launch Environment
     let host_envs: Vec<(String, String)> = std::env::vars().collect();
@@ -291,7 +298,7 @@ fn run_launcher() -> Result<(), LaunchError> {
         // 1. Add layer roots to path variables
         for ldir in &layer_dirs {
             env.add_root_dir(&ldir.to_string_lossy())
-                .map_err(LaunchError::LaunchEnv)?;
+                .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
         }
 
         // 2. Add env file modifications
@@ -300,11 +307,11 @@ fn run_launcher() -> Result<(), LaunchError> {
 
             // Apply <layer>/env
             env.add_env_dir(&format!("{}/env", ldir_str), ActionType::Override)
-                .map_err(LaunchError::LaunchEnv)?;
+                .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
 
             // Apply <layer>/env.launch
             env.add_env_dir(&format!("{}/env.launch", ldir_str), ActionType::Override)
-                .map_err(LaunchError::LaunchEnv)?;
+                .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
 
             // Apply <layer>/env.launch/<process>
             if !resolved_process.proc_type.is_empty() {
@@ -312,7 +319,7 @@ fn run_launcher() -> Result<(), LaunchError> {
                     &format!("{}/env.launch/{}", ldir_str, resolved_process.proc_type),
                     ActionType::Override,
                 )
-                .map_err(LaunchError::LaunchEnv)?;
+                .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
             }
         }
     }
@@ -480,7 +487,7 @@ fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError>
 
     for file in files {
         let file_str = file.to_string_lossy();
-        let res = exec_d::run_exec_d(&file_str, env).map_err(LaunchError::ExecD)?;
+        let res = exec_d::run_exec_d(&file_str, env).map_err(|e| LaunchError::ExecD(Box::new(e)))?;
         for (k, v) in res {
             env.set(&k, &v);
         }

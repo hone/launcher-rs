@@ -34,7 +34,7 @@ pub enum ExecDError {
     },
     Decode {
         path: String,
-        error: toml::de::Error,
+        error: Box<toml::de::Error>,
         output: String,
     },
 }
@@ -146,12 +146,13 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
         return Ok(HashMap::new());
     }
 
-    let env_vars: HashMap<String, String> =
-        toml::from_str(&toml_output).map_err(|e| ExecDError::Decode {
+    let env_vars: HashMap<String, String> = toml::from_str(&toml_output).map_err(|e| {
+        ExecDError::Decode {
             path: path.to_string(),
-            error: e,
+            error: Box::new(e),
             output: toml_output,
-        })?;
+        }
+    })?;
 
     Ok(env_vars)
 }
@@ -256,7 +257,7 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     let env_vars: HashMap<String, String> =
         toml::from_str(&toml_output).map_err(|e| ExecDError::Decode {
             path: path.to_string(),
-            error: e,
+            error: Box::new(e),
             output: toml_output,
         })?;
 
