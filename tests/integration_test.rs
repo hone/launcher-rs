@@ -54,6 +54,7 @@ api = "0.12"
 
     let script_content = r#"#!/bin/bash
 echo 'INJECTED_VAR = "injected_exec_d"' >&3
+echo "EXEC_D_PWD = \"$(pwd)\"" >&3
 "#;
     fs::write(&exec_d_script, script_content).unwrap();
 
@@ -105,6 +106,14 @@ echo 'INJECTED_VAR = "injected_exec_d"' >&3
     assert!(
         stdout_str.contains("INJECTED_VAR=injected_exec_d"),
         "Missing INJECTED_VAR in final env. Stdout: {}",
+        stdout_str
+    );
+    let canonical_app_path = app_path.canonicalize().unwrap();
+    let expected_pwd_env = format!("EXEC_D_PWD={}", canonical_app_path.to_string_lossy());
+    assert!(
+        stdout_str.contains(&expected_pwd_env),
+        "Missing or incorrect EXEC_D_PWD. Expected: {}, Stdout: {}",
+        expected_pwd_env,
         stdout_str
     );
 }
@@ -352,6 +361,50 @@ fn test_integration_platform_api_invalid() {
     assert!(
         stderr.contains("failed to parse platform API 'bad-api-version'"),
         "Unexpected error output: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_integration_cnb_process_type_warn() {
+    let layers_temp = tempdir().unwrap();
+    let layers_path = layers_temp.path();
+    let launcher_bin = Path::new("target/debug/launcher").canonicalize().unwrap();
+
+    let config_dir = layers_path.join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    let metadata_content = r#"
+[[processes]]
+type = "web"
+command = ["echo"]
+args = ["test"]
+direct = true
+default = true
+buildpack-id = "my-bp"
+
+[[buildpacks]]
+id = "my-bp"
+api = "0.12"
+"#;
+    fs::write(config_dir.join("metadata.toml"), metadata_content).unwrap();
+
+    let mut cmd = Command::new(&launcher_bin);
+    cmd.env("CNB_PLATFORM_API", "0.15");
+    cmd.env("CNB_LAYERS_DIR", layers_path.to_string_lossy().to_string());
+    cmd.env("CNB_PROCESS_TYPE", "direct-process");
+
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("Warning: CNB_PROCESS_TYPE is not supported in Platform API 0.15"),
+        "Expected warning message not found in stderr: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Warning: Run with ENTRYPOINT 'direct-process' to invoke the 'direct-process' process type"),
+        "Expected second warning message not found in stderr: {}",
         stderr
     );
 }

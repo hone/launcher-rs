@@ -76,13 +76,7 @@ fn print_warning(msg: &str) {
 
 fn main() {
     if let Err(e) = run_launcher() {
-        let err_str = e.to_string();
-        let msg = if err_str.starts_with("failed to ") {
-            err_str
-        } else {
-            format!("failed to {}", err_str)
-        };
-        print_error(&msg);
+        print_error(&e.to_string());
         std::process::exit(e.code().as_i32());
     }
 }
@@ -97,6 +91,10 @@ pub enum LaunchError {
     LaunchEnv(Box<env::LaunchEnvError>),
     ExecD(Box<exec_d::ExecDError>),
     ProcessSelection(Box<launch::ProcessSelectionError>),
+    ChangeAppDir {
+        path: String,
+        error: std::io::Error,
+    },
     MetadataNotFound {
         path: String,
     },
@@ -121,49 +119,66 @@ pub enum LaunchError {
 
 impl std::fmt::Display for LaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let prefix = match self {
+            LaunchError::PlatformApi(_)
+            | LaunchError::SetBuildpackApi { .. }
+            | LaunchError::MetadataNotFound { .. }
+            | LaunchError::MetadataRead { .. }
+            | LaunchError::MetadataParse { .. } => "failed to",
+            _ => "failed to launch:",
+        };
+
         match self {
             LaunchError::PlatformApi(api::platform::PlatformApiError::Empty) => {
                 write!(
                     f,
-                    "get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version"
+                    "{} get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version",
+                    prefix
                 )
             }
             LaunchError::PlatformApi(api::platform::PlatformApiError::Invalid(v)) => {
-                write!(f, "parse platform API '{}'", v)
+                write!(f, "{} parse platform API '{}'", prefix, v)
             }
             LaunchError::PlatformApi(api::platform::PlatformApiError::Incompatible(v)) => {
                 write!(
                     f,
-                    "set platform API: platform API version '{}' is incompatible with the lifecycle",
-                    v
+                    "{} set platform API: platform API version '{}' is incompatible with the lifecycle",
+                    prefix, v
                 )
             }
             LaunchError::SetBuildpackApi { bp_id, error } => {
-                write!(f, "set API for buildpack '{}': {}", bp_id, error)
+                write!(f, "{} set API for buildpack '{}': {}", prefix, bp_id, error)
             }
-            LaunchError::LaunchEnv(err) => write!(f, "{}", err),
-            LaunchError::ExecD(err) => write!(f, "{}", err),
-            LaunchError::ProcessSelection(err) => write!(f, "{}", err),
+            LaunchError::LaunchEnv(err) => write!(f, "{} {}", prefix, err),
+            LaunchError::ExecD(err) => write!(f, "{} {}", prefix, err),
+            LaunchError::ProcessSelection(err) => write!(f, "{} {}", prefix, err),
+            LaunchError::ChangeAppDir { path: _, error } => {
+                write!(f, "{} change to app directory: {}", prefix, error)
+            }
             LaunchError::MetadataNotFound { path } => {
-                write!(f, "read metadata: metadata file not found at '{}'", path)
+                write!(
+                    f,
+                    "{} read metadata: metadata file not found at '{}'",
+                    prefix, path
+                )
             }
             LaunchError::MetadataRead { path: _, error } => {
-                write!(f, "read metadata: {}", error)
+                write!(f, "{} read metadata: {}", prefix, error)
             }
             LaunchError::MetadataParse { error } => {
-                write!(f, "read metadata: parse failed: {}", error)
+                write!(f, "{} read metadata: parse failed: {}", prefix, error)
             }
             LaunchError::ListLayerDirs { context, error } => {
-                write!(f, "{}: {}", context, error)
+                write!(f, "{} {}: {}", prefix, context, error)
             }
             LaunchError::ListLayerFiles { context, error } => {
-                write!(f, "{}: {}", context, error)
+                write!(f, "{} {}: {}", prefix, context, error)
             }
             LaunchError::DirectExec(error) => {
-                write!(f, "direct exec: {}", error)
+                write!(f, "{} direct exec: {}", prefix, error)
             }
             LaunchError::BashExec(error) => {
-                write!(f, "bash exec: {}", error)
+                write!(f, "{} bash exec: {}", prefix, error)
             }
         }
     }
@@ -281,6 +296,12 @@ fn run_launcher() -> Result<(), LaunchError> {
     let resolved_process = selector
         .select()
         .map_err(|e| LaunchError::ProcessSelection(Box::new(e)))?;
+
+    // Change to app directory
+    std::env::set_current_dir(&app_dir).map_err(|e| LaunchError::ChangeAppDir {
+        path: app_dir.clone(),
+        error: e,
+    })?;
 
     // 8. Prepare Launch Environment
     let host_envs: Vec<(String, String)> = std::env::vars().collect();

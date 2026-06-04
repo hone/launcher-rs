@@ -276,8 +276,9 @@ impl<'a> ProcessSelector<'a> {
         } else {
             None
         };
-        if let Some(raw_proc) = raw_proc_opt {
-            return resolve_process(
+
+        let mut resolved = if let Some(raw_proc) = raw_proc_opt {
+            resolve_process(
                 raw_proc,
                 &self.metadata.buildpacks,
                 self.platform_api,
@@ -287,32 +288,29 @@ impl<'a> ProcessSelector<'a> {
             .ok_or_else(|| ProcessSelectionError::IneligibleProcess {
                 name: process_name.clone(),
                 exec_env: self.exec_env.to_string(),
-            });
-        }
-
-        if user_args.is_empty() {
+            })?
+        } else if user_args.is_empty() {
             // Rule 2: Default process from metadata
             if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.default) {
-                return resolve_process(
+                resolve_process(
                     raw_proc,
                     &self.metadata.buildpacks,
                     self.platform_api,
                     self.exec_env,
                     &[],
                 )?
-                .ok_or(ProcessSelectionError::IneligibleDefault);
+                .ok_or(ProcessSelectionError::IneligibleDefault)?
+            } else {
+                return Err(ProcessSelectionError::NoCommandAndNoDefault);
             }
-            return Err(ProcessSelectionError::NoCommandAndNoDefault);
-        }
-
-        // Rule 3: user_args[0] matches a process type (fallback mechanism)
-        if let Some(raw_proc) = self
+        } else if let Some(raw_proc) = self
             .metadata
             .processes
             .iter()
             .find(|p| p.proc_type == user_args[0])
         {
-            return resolve_process(
+            // Rule 3: user_args[0] matches a process type (fallback mechanism)
+            resolve_process(
                 raw_proc,
                 &self.metadata.buildpacks,
                 self.platform_api,
@@ -321,11 +319,16 @@ impl<'a> ProcessSelector<'a> {
             )?
             .ok_or_else(|| ProcessSelectionError::IneligibleProcessSimple {
                 name: user_args[0].clone(),
-            });
-        }
+            })?
+        } else {
+            // Rule 4: Custom user-provided command
+            return ResolvedProcess::user_provided(&user_args, self.app_dir);
+        };
 
-        // Rule 4: Custom user-provided command
-        ResolvedProcess::user_provided(&user_args, self.app_dir)
+        if resolved.working_directory.is_empty() {
+            resolved.working_directory = self.app_dir.to_string();
+        }
+        Ok(resolved)
     }
 }
 
@@ -670,6 +673,7 @@ mod tests {
         let res = selector.select().unwrap();
         assert_eq!(res.proc_type, "worker");
         assert_eq!(res.args, vec!["--flag".to_string()]); // API >= 0.9 user args replace default args
+        assert_eq!(res.working_directory, "/workspace");
 
         // Rule 2: Default process (argv0 is launcher, no user args)
         let selector = ProcessSelector {
@@ -681,6 +685,7 @@ mod tests {
         };
         let res = selector.select().unwrap();
         assert_eq!(res.proc_type, "web"); // web is default
+        assert_eq!(res.working_directory, "/workspace");
 
         // Rule 3: user_args[0] matches process type
         let selector = ProcessSelector {
@@ -695,6 +700,7 @@ mod tests {
         };
         let res = selector.select().unwrap();
         assert_eq!(res.proc_type, "worker");
+        assert_eq!(res.working_directory, "/workspace");
 
         // Rule 4: Custom user-provided command
         let selector = ProcessSelector {
@@ -711,5 +717,6 @@ mod tests {
         let res = selector.select().unwrap();
         assert_eq!(res.command, "python");
         assert_eq!(res.args, vec!["script.py".to_string()]);
+        assert_eq!(res.working_directory, "/workspace");
     }
 }
