@@ -87,25 +87,40 @@ pub struct CmdShell;
 #[cfg(windows)]
 impl Shell for CmdShell {
     fn launch(&self, proc: ShellProcess) -> Result<(), std::io::Error> {
-        let mut command_tokens = Vec::new();
+        use std::os::windows::process::CommandExt;
+
+        let mut parts = Vec::new();
+
+        // 1. Profile script sourcing
         for profile in &proc.profiles {
-            command_tokens.push("call".to_string());
-            command_tokens.push(profile.clone());
-            command_tokens.push("&&".to_string());
+            parts.push("call".to_string());
+            parts.push(escape_msvc_arg(profile));
+            parts.push("&&".to_string());
         }
-        command_tokens.push("cd".to_string());
-        command_tokens.push("/d".to_string());
-        command_tokens.push(proc.working_directory.clone());
-        command_tokens.push("&&".to_string());
-        command_tokens.push(proc.command.clone());
-        command_tokens.extend(proc.args.clone());
+
+        // 2. Working directory transition
+        parts.push("cd".to_string());
+        parts.push("/d".to_string());
+        parts.push(escape_msvc_arg(&proc.working_directory));
+        parts.push("&&".to_string());
+
+        // 3. Command and its arguments
+        parts.push(escape_msvc_arg(&proc.command));
+        for arg in &proc.args {
+            parts.push(escape_msvc_arg(arg));
+        }
+
+        let cmd_line = parts.join(" ");
 
         let mut cmd = Command::new("cmd");
         cmd.arg("/q");
         cmd.arg("/v:on");
         cmd.arg("/s");
         cmd.arg("/c");
-        cmd.args(&command_tokens);
+
+        // Wrap the entire command line in outer quotes.
+        // cmd.exe /s /c will strip the outer quotes and safely run the inner escaped command.
+        cmd.raw_arg(&format!("\"{}\"", cmd_line));
 
         cmd.env_clear();
         cmd.envs(&proc.env);
@@ -114,6 +129,65 @@ impl Shell for CmdShell {
         let status = child.wait()?;
         std::process::exit(status.code().unwrap_or(0));
     }
+}
+
+/// Escapes a command line argument using standard MSVC escaping rules,
+/// but also forces quoting if Windows shell metacharacters or quotes are present.
+#[cfg(any(windows, test))]
+fn escape_msvc_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+
+    let needs_quoting = arg.chars().any(|c| {
+        c == ' '
+            || c == '\t'
+            || c == '\n'
+            || c == '\x0b'
+            || c == '"'
+            || c == '&'
+            || c == '|'
+            || c == '<'
+            || c == '>'
+            || c == '^'
+            || c == '%'
+            || c == '!'
+            || c == '('
+            || c == ')'
+    });
+
+    if !needs_quoting {
+        return arg.to_string();
+    }
+
+    let mut escaped = String::new();
+    escaped.push('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else if c == '"' {
+            for _ in 0..backslashes {
+                escaped.push('\\');
+                escaped.push('\\');
+            }
+            escaped.push('\\');
+            escaped.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                escaped.push('\\');
+            }
+            escaped.push(c);
+            backslashes = 0;
+        }
+    }
+    for _ in 0..backslashes {
+        escaped.push('\\');
+        escaped.push('\\');
+    }
+    escaped.push('"');
+    escaped
 }
 
 /// Generates the shell argument-evaluation bash command, mimicking Go's `bashCommandWithTokens`.
@@ -144,5 +218,26 @@ mod tests {
             bash_command_with_tokens(3),
             "exec bash -c '\"$(eval echo \\\"$0\\\")\" \"$(eval echo \\\"${1}\\\")\" \"$(eval echo \\\"${2}\\\")\"' \"${@:1}\""
         );
+    }
+
+    #[test]
+    fn test_escape_msvc_arg() {
+        assert_eq!(escape_msvc_arg(""), "\"\"");
+        assert_eq!(escape_msvc_arg("simple"), "simple");
+        assert_eq!(escape_msvc_arg("space arg"), "\"space arg\"");
+        assert_eq!(
+            escape_msvc_arg("arg&with&specials"),
+            "\"arg&with&specials\""
+        );
+        assert_eq!(escape_msvc_arg("a\\b"), "a\\b");
+        assert_eq!(escape_msvc_arg("a\\ b"), "\"a\\ b\"");
+        assert_eq!(escape_msvc_arg("a\\\\b"), "a\\\\b");
+        assert_eq!(escape_msvc_arg("a\\\\ b"), "\"a\\\\ b\"");
+        assert_eq!(escape_msvc_arg("a\"b"), "\"a\\\"b\"");
+        assert_eq!(escape_msvc_arg("a\\\"b"), "\"a\\\\\\\"b\"");
+        assert_eq!(escape_msvc_arg("a\\\\\"b"), "\"a\\\\\\\\\\\"b\"");
+        assert_eq!(escape_msvc_arg("a\\"), "a\\");
+        assert_eq!(escape_msvc_arg("a\\\\"), "a\\\\");
+        assert_eq!(escape_msvc_arg("a \\"), "\"a \\\\\"");
     }
 }
