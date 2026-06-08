@@ -8,38 +8,21 @@ use super::Version;
 use std::str::FromStr;
 
 /// The list of Platform API versions supported by this lifecycle launcher.
-pub const SUPPORTED_PLATFORM_APIS: &[&str] = &[
-    "0.7", "0.8", "0.9", "0.10", "0.11", "0.12", "0.13", "0.14", "0.15",
+pub const SUPPORTED_PLATFORM_APIS: &[Version] = &[
+    Version::new(0, 7),
+    Version::new(0, 8),
+    Version::new(0, 9),
+    Version::new(0, 10),
+    Version::new(0, 11),
+    Version::new(0, 12),
+    Version::new(0, 13),
+    Version::new(0, 14),
+    Version::new(0, 15),
 ];
 
 /// The list of supported but deprecated Platform API versions.
 /// Deprecated versions will issue a warning upon verification but are still allowed to execute.
-pub const DEPRECATED_PLATFORM_APIS: &[&str] = &[];
-
-/// Checks if the requested Platform API [`Version`] is supported by the launcher.
-///
-/// Under the CNB specification, a platform API version is supported if any version in
-/// [`SUPPORTED_PLATFORM_APIS`] is a superset of (compatible with) the requested version.
-pub fn is_supported(requested: &Version) -> bool {
-    SUPPORTED_PLATFORM_APIS.iter().any(|&sup| {
-        if let Ok(sup_ver) = Version::from_str(sup) {
-            sup_ver.is_superset_of(requested)
-        } else {
-            false
-        }
-    })
-}
-
-/// Checks if the requested Platform API [`Version`] is deprecated.
-pub fn is_deprecated(requested: &Version) -> bool {
-    DEPRECATED_PLATFORM_APIS.iter().any(|&dep| {
-        if let Ok(dep_ver) = Version::from_str(dep) {
-            dep_ver.is_superset_of(requested)
-        } else {
-            false
-        }
-    })
-}
+pub const DEPRECATED_PLATFORM_APIS: &[Version] = &[];
 
 /// Errors that can occur during Platform API verification.
 #[derive(Debug, PartialEq, Eq)]
@@ -85,8 +68,8 @@ pub fn verify_platform_api(requested_str: &str) -> Result<Version, PlatformApiEr
     let requested =
         Version::from_str(clean).map_err(|_| PlatformApiError::Invalid(clean.to_string()))?;
 
-    if is_supported(&requested) {
-        if is_deprecated(&requested) {
+    if super::is_supported(&requested, SUPPORTED_PLATFORM_APIS) {
+        if super::is_deprecated(&requested, DEPRECATED_PLATFORM_APIS) {
             // Note: We can implement deprecation warnings if required
             eprintln!("Platform requested deprecated API '{}'", clean);
         }

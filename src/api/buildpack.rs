@@ -8,35 +8,17 @@ use super::Version;
 use std::str::FromStr;
 
 /// The list of Buildpack API versions supported by this lifecycle launcher.
-pub const SUPPORTED_BUILDPACK_APIS: &[&str] = &["0.7", "0.8", "0.9", "0.10", "0.11", "0.12"];
+pub const SUPPORTED_BUILDPACK_APIS: &[Version] = &[
+    Version::new(0, 7),
+    Version::new(0, 8),
+    Version::new(0, 9),
+    Version::new(0, 10),
+    Version::new(0, 11),
+    Version::new(0, 12),
+];
 
 /// The list of supported but deprecated Buildpack API versions.
-pub const DEPRECATED_BUILDPACK_APIS: &[&str] = &[];
-
-/// Checks if the requested Buildpack API [`Version`] is supported by the launcher.
-///
-/// Under the CNB specification, a buildpack API version is supported if any version in
-/// [`SUPPORTED_BUILDPACK_APIS`] is a superset of (compatible with) the requested version.
-pub fn is_supported(requested: &Version) -> bool {
-    SUPPORTED_BUILDPACK_APIS.iter().any(|&sup| {
-        if let Ok(sup_ver) = Version::from_str(sup) {
-            sup_ver.is_superset_of(requested)
-        } else {
-            false
-        }
-    })
-}
-
-/// Checks if the requested Buildpack API [`Version`] is deprecated.
-pub fn is_deprecated(requested: &Version) -> bool {
-    DEPRECATED_BUILDPACK_APIS.iter().any(|&dep| {
-        if let Ok(dep_ver) = Version::from_str(dep) {
-            dep_ver.is_superset_of(requested)
-        } else {
-            false
-        }
-    })
-}
+pub const DEPRECATED_BUILDPACK_APIS: &[Version] = &[];
 
 /// Errors that can occur during Buildpack API verification.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -107,8 +89,8 @@ pub fn verify_buildpack_api(
         error: e,
     })?;
 
-    if is_supported(&requested) {
-        if is_deprecated(&requested) {
+    if super::is_supported(&requested, SUPPORTED_BUILDPACK_APIS) {
+        if super::is_deprecated(&requested, DEPRECATED_BUILDPACK_APIS) {
             eprintln!("Buildpack '{}' requested deprecated API '{}'", bp_id, clean);
         }
         Ok(requested)

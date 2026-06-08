@@ -24,7 +24,7 @@ pub struct Version {
 
 impl Version {
     /// Creates a new `Version` instance with the specified major and minor version numbers.
-    pub fn new(major: u64, minor: u64) -> Self {
+    pub const fn new(major: u64, minor: u64) -> Self {
         Version { major, minor }
     }
 
@@ -92,6 +92,16 @@ impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.major, self.minor)
     }
+}
+
+/// Checks if a version is compatible with any of the API versions in the list.
+fn is_supported(requested: &Version, list: &[Version]) -> bool {
+    list.iter().any(|v| v.is_superset_of(requested))
+}
+
+/// Checks if a version is deprecated by any of the API versions in the list.
+fn is_deprecated(requested: &Version, list: &[Version]) -> bool {
+    list.iter().any(|v| v.is_superset_of(requested))
 }
 
 #[cfg(test)]
