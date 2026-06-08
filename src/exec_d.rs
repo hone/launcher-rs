@@ -18,10 +18,6 @@ use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::io::FromRawFd;
-#[cfg(unix)]
-use std::os::unix::io::IntoRawFd;
-#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 /// Errors that can occur during execution of `exec.d` helper binaries.
@@ -127,21 +123,9 @@ pub fn run_exec_d<P: AsRef<Path>>(
     unsafe {
         cmd.pre_exec(move || {
             // Duplicate the write end of the pipe to File Descriptor 3 in the child process
-            let borrowed_writer = std::os::unix::io::BorrowedFd::borrow_raw(writer_fd);
-
-            // We construct an OwnedFd for FD 3, which dup2 requires as the target.
-            // This is unsafe because we are claiming ownership of FD 3, which is fine
-            // since we are in the child process and about to either overwrite it or fail.
-            let mut target = std::os::unix::io::OwnedFd::from_raw_fd(3);
-
-            if let Err(e) = rustix::io::dup2(borrowed_writer, &mut target) {
-                // Leak target so it doesn't try to close an invalid FD on error
-                let _ = target.into_raw_fd();
-                return Err(e.into());
+            if libc::dup2(writer_fd, 3) == -1 {
+                return Err(std::io::Error::last_os_error());
             }
-
-            // Leak target so FD 3 stays open for the exec'd process!
-            let _ = target.into_raw_fd();
             Ok(())
         });
     }
