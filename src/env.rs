@@ -1,3 +1,10 @@
+//! Environment variables management and CNB compliance.
+//!
+//! This module manages variables during launcher initialization and execution. It is responsible
+//! for purging forbidden variables from the host environment, sanitizing path-like lists (e.g., `PATH`
+//! and `LD_LIBRARY_PATH`), and loading layered configuration directories (`env`, `env.launch`, and
+//! `env.launch/<process>`) according to the Cloud Native Buildpacks specification rules.
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,11 +45,30 @@ pub const LAUNCH_ENV_EXCLUDELIST: &[&str] = &[
     "CNB_DEPRECATION_MODE",
 ];
 
+/// Errors that can occur when processing the launch environment.
 #[derive(Debug)]
 pub enum LaunchEnvError {
-    Canonicalize { path: String, error: std::io::Error },
-    ListDir { path: String, error: std::io::Error },
-    ReadFile { path: String, error: std::io::Error },
+    /// Failed to canonicalize a layer directory path.
+    Canonicalize {
+        /// The path that failed canonicalization.
+        path: String,
+        /// The underlying I/O error.
+        error: std::io::Error,
+    },
+    /// Failed to list the contents of an environment directory.
+    ListDir {
+        /// The directory path that failed to list.
+        path: String,
+        /// The underlying I/O error.
+        error: std::io::Error,
+    },
+    /// Failed to read the contents of an environment variable file.
+    ReadFile {
+        /// The file path that failed to read.
+        path: String,
+        /// The underlying I/O error.
+        error: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for LaunchEnvError {
@@ -214,6 +240,10 @@ impl LaunchEnv {
         &self.vars
     }
 
+    /// Evaluates how to modify the environment variable value based on the specified [`ActionType`].
+    ///
+    /// Returns `Some(String)` with the new value if the action is successful, or `None` if the action
+    /// specifies a modification that should be skipped (e.g., `Default` on a non-empty variable).
     fn evaluate_env_modifier(
         &self,
         name: &str,
@@ -259,6 +289,12 @@ impl LaunchEnv {
     }
 }
 
+/// Parses a filename from an environment directory into the target environment variable name
+/// and the corresponding [`ActionType`] modifier suffix.
+///
+/// File names can optionally end with a dot followed by the action type (e.g. `.override`, `.default`,
+/// `.append`, `.prepend`). If no suffix is present, the specified `default_action` is returned.
+/// Files ending with `.delim` are ignored.
 fn parse_env_file_parts(
     file_name: &str,
     default_action: ActionType,

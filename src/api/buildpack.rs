@@ -1,10 +1,22 @@
+//! Buildpack API validation and compatibility checks.
+//!
+//! This module defines the Buildpack API versions supported by this launcher implementation,
+//! provides utilities to check support and deprecation status, and exports the [`verify_buildpack_api`]
+//! function to validate buildpack-contributed API versions declared in the metadata.
+
 use super::Version;
 use std::str::FromStr;
 
+/// The list of Buildpack API versions supported by this lifecycle launcher.
 pub const SUPPORTED_BUILDPACK_APIS: &[&str] = &["0.7", "0.8", "0.9", "0.10", "0.11", "0.12"];
 
+/// The list of supported but deprecated Buildpack API versions.
 pub const DEPRECATED_BUILDPACK_APIS: &[&str] = &[];
 
+/// Checks if the requested Buildpack API [`Version`] is supported by the launcher.
+///
+/// Under the CNB specification, a buildpack API version is supported if any version in
+/// [`SUPPORTED_BUILDPACK_APIS`] is a superset of (compatible with) the requested version.
 pub fn is_supported(requested: &Version) -> bool {
     SUPPORTED_BUILDPACK_APIS.iter().any(|&sup| {
         if let Ok(sup_ver) = Version::from_str(sup) {
@@ -15,6 +27,7 @@ pub fn is_supported(requested: &Version) -> bool {
     })
 }
 
+/// Checks if the requested Buildpack API [`Version`] is deprecated.
 pub fn is_deprecated(requested: &Version) -> bool {
     DEPRECATED_BUILDPACK_APIS.iter().any(|&dep| {
         if let Ok(dep_ver) = Version::from_str(dep) {
@@ -25,15 +38,23 @@ pub fn is_deprecated(requested: &Version) -> bool {
     })
 }
 
+/// Errors that can occur during Buildpack API verification.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum BuildpackApiError {
+    /// Failed to parse the Buildpack API version string.
     Parse {
+        /// The identifier of the buildpack.
         bp_id: String,
+        /// The raw version string that failed parsing.
         version: String,
+        /// The inner parsing error description.
         error: String,
     },
+    /// The Buildpack API version is not supported by this lifecycle launcher.
     Incompatible {
+        /// The identifier of the buildpack.
         bp_id: String,
+        /// The incompatible version string.
         version: String,
     },
 }
@@ -65,6 +86,16 @@ impl std::fmt::Display for BuildpackApiError {
 
 impl std::error::Error for BuildpackApiError {}
 
+/// Verifies whether the requested Buildpack API version string is supported.
+///
+/// # Arguments
+///
+/// * `bp_id` - The identifier of the buildpack.
+/// * `requested_str` - The raw buildpack API version string declared in the buildpack metadata.
+///
+/// # Errors
+///
+/// Returns [`BuildpackApiError`] if the version string cannot be parsed or is incompatible.
 pub fn verify_buildpack_api(
     bp_id: &str,
     requested_str: &str,

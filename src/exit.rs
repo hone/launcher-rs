@@ -1,3 +1,8 @@
+//! Exit code definitions for the CNB Launcher.
+//!
+//! This module defines the [`ExitCode`] enum representing standard exit codes returned by the launcher.
+//! These status codes conform to the Cloud Native Buildpacks (CNB) lifecycle specification contract.
+
 /// Standard exit codes returned by the Cloud Native Buildpacks (CNB) launcher.
 /// These exit codes are part of the launcher's public CLI contract with the platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,3 +1,13 @@
+//! Compilation and execution of CNB `exec.d` binaries.
+//!
+//! Before the application process is launched, buildpacks can run initialization binaries placed in
+//! `exec.d/` directories. These programs output TOML key-value pairs representing environment variables
+//! that must be set in the final process.
+//!
+//! Under Unix, the communication is established using an OS pipe mapped to File Descriptor 3 in the child.
+//! Under Windows, the communication is established using an inherited Win32 pipe handle specified by
+//! the `CNB_EXEC_D_HANDLE` environment variable.
+
 use crate::env::LaunchEnv;
 use std::collections::HashMap;
 use std::fs::File;
@@ -14,28 +24,46 @@ use std::os::unix::io::IntoRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+/// Errors that can occur during execution of `exec.d` helper binaries.
 #[derive(Debug)]
 pub enum ExecDError {
+    /// Failed to create the OS pipe for process communication.
     CreatePipe(String),
+    /// Failed to spawn the `exec.d` child process.
     Spawn {
+        /// The path of the binary that failed to spawn.
         path: String,
+        /// The underlying I/O error.
         error: std::io::Error,
     },
+    /// Failed to read output from the communication pipe.
     ReadOutput {
+        /// The underlying I/O error.
         error: std::io::Error,
+        /// Description of the channel (e.g., `"FD 3"`, `"handle"`).
         channel: &'static str,
     },
+    /// Failed to wait for the child process to exit.
     Wait {
+        /// The path of the binary.
         path: String,
+        /// The underlying I/O error.
         error: std::io::Error,
     },
+    /// The `exec.d` binary exited with a non-zero status.
     ExecutionFailed {
+        /// The path of the binary.
         path: String,
+        /// The exit status.
         status: std::process::ExitStatus,
     },
+    /// Failed to parse the TOML map returned by the binary.
     Decode {
+        /// The path of the binary.
         path: String,
+        /// The TOML deserialization error.
         error: Box<toml::de::Error>,
+        /// The raw output string that failed parsing.
         output: String,
     },
 }
@@ -163,6 +191,7 @@ pub fn run_exec_d<P: AsRef<Path>>(
 
 #[cfg(windows)]
 #[allow(non_snake_case)]
+/// Internal Windows API declarations for pipe creation and process communication.
 mod win32 {
     use std::ffi::c_void;
 

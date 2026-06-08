@@ -1,3 +1,9 @@
+//! Process selection, routing, and launching strategies.
+//!
+//! This module implements the core logic for selecting which process type to run (either from
+//! buildpack metadata or custom user-supplied commands) and executing it either directly (shell-free)
+//! or via a shell wrapper.
+
 use crate::api::Version;
 use crate::env::LaunchEnv;
 use serde::Deserialize;
@@ -144,6 +150,7 @@ pub struct ResolvedProcess {
     pub args: Vec<String>,
     /// The resolved working directory.
     pub working_directory: String,
+    /// If `true`, the process should run directly (without a shell) via process replacement.
     pub direct: bool,
 }
 
@@ -281,7 +288,16 @@ impl ResolvedProcess {
         }))
     }
 
-    /// Launches a process directly (without a shell) using Unix process replacement.
+    /// Launches the resolved process directly without a shell using process replacement (Unix)
+    /// or process spawning followed by parent exit (Windows).
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The [`LaunchEnv`] containing environment variables to configure for the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] if the command lookup, working directory switch, or process spawn fails.
     #[cfg(unix)]
     pub fn launch_direct(&self, env: &LaunchEnv) -> Result<(), std::io::Error> {
         use std::os::unix::process::CommandExt;
@@ -316,7 +332,16 @@ impl ResolvedProcess {
         Err(err)
     }
 
-    /// Launches a process directly (without a shell) on Windows.
+    /// Launches the resolved process directly without a shell using process replacement (Unix)
+    /// or process spawning followed by parent exit (Windows).
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The [`LaunchEnv`] containing environment variables to configure for the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] if the command lookup, working directory switch, or process spawn fails.
     #[cfg(windows)]
     pub fn launch_direct(&self, env: &LaunchEnv) -> Result<(), std::io::Error> {
         let path_val = env.get("PATH").cloned().unwrap_or_default();

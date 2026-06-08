@@ -1,3 +1,9 @@
+//! Shell wrapper and profile sourcing execution.
+//!
+//! When launching in indirect mode, the target process is wrapped in a shell execution payload.
+//! This module handles building and launching the shell wrapper (Bash on Unix, CMD on Windows)
+//! and sourcing any buildpack-contributed profile scripts before starting the process.
+
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -25,6 +31,14 @@ pub struct ShellProcess {
 /// Defines the shell runner trait to launch command sessions.
 pub trait Shell {
     /// Replaces the current process image or executes the command inside a shell environment.
+    ///
+    /// # Arguments
+    ///
+    /// * `proc` - The [`ShellProcess`] containing shell wrapper parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] if execution or shell spawning fails.
     fn launch(&self, proc: ShellProcess) -> Result<(), std::io::Error>;
 }
 

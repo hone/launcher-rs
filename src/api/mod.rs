@@ -1,7 +1,16 @@
+//! API version validation and handling for the Cloud Native Buildpacks (CNB) Launcher.
+//!
+//! This module provides the [`Version`] struct to parse and compare SemVer-like version
+//! strings (e.g., "0.7", "1.12") representing Platform and Buildpack API versions.
+//! It also exposes the [`platform`] and [`buildpack`] submodules to enforce compatibility
+//! rules according to CNB specification requirements.
+
 use std::fmt;
 use std::str::FromStr;
 
+/// Rules and validation logic for Cloud Native Buildpack API versions.
 pub mod buildpack;
+/// Rules and validation logic for Cloud Native Platform API versions.
 pub mod platform;
 
 /// Represents a SemVer-like Platform or Buildpack API version, supporting major and minor keys.

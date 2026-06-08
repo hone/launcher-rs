@@ -1,3 +1,13 @@
+//! Binary entry point for the Cloud Native Buildpacks (CNB) Launcher.
+//!
+//! The launcher is responsible for executing the buildpack-configured processes or user-provided
+//! commands in a container environment. It performs the following steps:
+//! 1. Parses and validates the Platform API version.
+//! 2. Reads the buildpack metadata and process definitions from `metadata.toml`.
+//! 3. Determines the process to execute (using symlink name, default process, or command arguments).
+//! 4. Sets up the launch environment by loading layers, env files, and executing `exec.d` helper scripts.
+//! 5. Sources profile scripts and replaces the launcher process with the final target application.
+
 pub mod api;
 pub mod env;
 pub mod exec_d;
@@ -40,6 +50,8 @@ pub const CNB_LIFECYCLE_DIR: &str = "/cnb/lifecycle";
 #[cfg(target_family = "windows")]
 pub const CNB_LIFECYCLE_DIR: &str = "c:\\cnb\\lifecycle";
 
+/// Checks if log output should use ANSI color sequences based on the `CNB_NO_COLOR`
+/// environment variable and whether standard error is a TTY.
 fn should_enable_color() -> bool {
     if std::env::var("CNB_NO_COLOR")
         .map(|v| v.trim().to_lowercase() == "true")
@@ -50,6 +62,7 @@ fn should_enable_color() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// Formats an error message with optional ANSI red color highlighting.
 fn format_error(msg: &str, enable_color: bool) -> String {
     if enable_color {
         format!("\x1b[31;1mERROR: \x1b[0m{}", msg)
@@ -58,6 +71,7 @@ fn format_error(msg: &str, enable_color: bool) -> String {
     }
 }
 
+/// Formats a warning message with optional ANSI yellow color highlighting.
 fn format_warning(msg: &str, enable_color: bool) -> String {
     if enable_color {
         format!("\x1b[33;1mWarning: \x1b[0m{}", msg)
@@ -66,10 +80,12 @@ fn format_warning(msg: &str, enable_color: bool) -> String {
     }
 }
 
+/// Prints an error message to standard error.
 fn print_error(msg: &str) {
     eprintln!("{}", format_error(msg, should_enable_color()));
 }
 
+/// Prints a warning message to standard error.
 fn print_warning(msg: &str) {
     eprintln!("{}", format_warning(msg, should_enable_color()));
 }
@@ -81,39 +97,65 @@ fn main() {
     }
 }
 
+/// Errors that can occur during the execution of the launcher binary.
 #[derive(Debug)]
 pub enum LaunchError {
+    /// Error verifying the Platform API.
     PlatformApi(api::platform::PlatformApiError),
+    /// Error verifying a buildpack API version.
     SetBuildpackApi {
+        /// The identifier of the buildpack.
         bp_id: String,
+        /// The inner verification error.
         error: api::buildpack::BuildpackApiError,
     },
+    /// Error building the launch environment.
     LaunchEnv(Box<env::LaunchEnvError>),
+    /// Error executing an `exec.d` initialization script.
     ExecD(Box<exec_d::ExecDError>),
+    /// Error resolving or selecting the process to execute.
     ProcessSelection(Box<launch::ProcessSelectionError>),
+    /// Failed to change the current working directory to the app directory.
     ChangeAppDir {
+        /// The targeted application path.
         path: String,
+        /// The underlying I/O error.
         error: std::io::Error,
     },
+    /// The `metadata.toml` configuration file was not found.
     MetadataNotFound {
+        /// The expected path of `metadata.toml`.
         path: String,
     },
+    /// Failed to read the `metadata.toml` configuration file.
     MetadataRead {
+        /// The path of the file.
         path: String,
+        /// The underlying I/O error.
         error: std::io::Error,
     },
+    /// Failed to parse the `metadata.toml` configuration file.
     MetadataParse {
+        /// The TOML parsing error.
         error: toml::de::Error,
     },
+    /// Failed to list the subdirectories of a buildpack layer directory.
     ListLayerDirs {
+        /// Context string describing what was being listed.
         context: String,
+        /// The underlying I/O error.
         error: std::io::Error,
     },
+    /// Failed to list the files in a layer subdirectory (e.g. `exec.d` or `profile.d`).
     ListLayerFiles {
+        /// Context string describing what was being listed.
         context: String,
+        /// The underlying I/O error.
         error: std::io::Error,
     },
+    /// Direct process replacement execution failed.
     DirectExec(std::io::Error),
+    /// Indirect shell-wrapped execution failed.
     BashExec(std::io::Error),
 }
 
@@ -202,6 +244,14 @@ impl LaunchError {
     }
 }
 
+/// The core execution flow of the launcher.
+///
+/// Resolves the Platform API, reads metadata, determines the process type, prepares the
+/// environment, runs `exec.d` scripts, and replaces the process image with the final command.
+///
+/// # Errors
+///
+/// Returns a [`LaunchError`] if any initialization, verification, or execution step fails.
 fn run_launcher() -> Result<(), LaunchError> {
     // 1. Parse and verify Platform API
     let platform_api_str =
@@ -435,6 +485,16 @@ fn run_launcher() -> Result<(), LaunchError> {
     }
 }
 
+/// Reads the directory entries of a buildpack layer directory, returning the subdirectory paths sorted alphabetically.
+///
+/// # Arguments
+///
+/// * `bp_dir` - The path to the buildpack layer directory.
+/// * `error_context` - A string used to enrich any I/O errors that occur.
+///
+/// # Errors
+///
+/// Returns [`LaunchError::ListLayerDirs`] if listing the directory fails.
 fn read_layer_dirs<P: AsRef<Path>>(
     bp_dir: P,
     error_context: &str,
@@ -467,6 +527,16 @@ fn read_layer_dirs<P: AsRef<Path>>(
     Ok(dirs)
 }
 
+/// Reads the directory entries of a directory, returning only file paths sorted alphabetically.
+///
+/// # Arguments
+///
+/// * `dir` - The path to the directory.
+/// * `error_context` - A string used to enrich any I/O errors that occur.
+///
+/// # Errors
+///
+/// Returns [`LaunchError::ListLayerFiles`] if listing the directory fails.
 fn read_layer_files<P: AsRef<Path>>(
     dir: P,
     error_context: &str,
@@ -499,10 +569,18 @@ fn read_layer_files<P: AsRef<Path>>(
     Ok(files)
 }
 
+/// Escapes a buildpack identifier (replacing `/` with `_`) to obtain its folder name.
 fn escape_id(id: &str) -> String {
     id.replace('/', "_")
 }
 
+/// Scans a directory for `exec.d` scripts and executes them sequentially.
+///
+/// The environment variable outputs of each execution are merged into the launcher's environment [`LaunchEnv`].
+///
+/// # Errors
+///
+/// Returns [`LaunchError`] if listing the directory or running any binary fails.
 fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError> {
     let files = read_layer_files(dir, "List exec.d dir")?;
 
@@ -515,6 +593,11 @@ fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError>
     Ok(())
 }
 
+/// Scans a directory for profile scripts and appends their paths to the provided list.
+///
+/// # Errors
+///
+/// Returns [`LaunchError::ListLayerFiles`] if listing the directory fails.
 fn accumulate_files_in_dir(dir: &Path, list: &mut Vec<String>) -> Result<(), LaunchError> {
     let files = read_layer_files(dir, "List profile.d dir")?;
 
