@@ -80,7 +80,7 @@ jobs:
           "$sha  launcher-${{ github.ref_name }}+${{ matrix.suffix }}.zip" | Out-File -FilePath launcher-${{ github.ref_name }}+${{ matrix.suffix }}.zip.sha256 -Encoding ascii
 
       - name: Upload Binary Package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: launcher-${{ matrix.suffix }}
           path: |
@@ -111,7 +111,7 @@ jobs:
           shasum -a 256 launcher-v${{ env.VERSION }}-bom.cdx.json > launcher-v${{ env.VERSION }}-bom.cdx.json.sha256
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: launcher-bom-cdx
           path: launcher-v${{ env.VERSION }}-bom.cdx.json*
