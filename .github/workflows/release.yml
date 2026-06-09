@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    name: Build & Package - ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: s390x-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Cross-Compilation Toolchains
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build Release Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Package Tarball (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/launcher dist/launcher
+          syft dist/launcher -o json=dist/launcher.sbom.syft.json
+          syft dist/launcher -o spdx-json=dist/launcher.sbom.spdx.json
+          syft dist/launcher -o cyclonedx-json=dist/launcher.sbom.cdx.json
+          tar -C dist -czf launcher-${{ matrix.target }}.tgz \
+            launcher \
+            launcher.sbom.syft.json \
+            launcher.sbom.spdx.json \
+            launcher.sbom.cdx.json
+          sha256sum launcher-${{ matrix.target }}.tgz > launcher-${{ matrix.target }}.tgz.sha256
+
+      - name: Package Zip (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item -Path target\${{ matrix.target }}\release\launcher.exe -Destination dist\launcher.exe
+          syft dist\launcher.exe -o json=dist\launcher.sbom.syft.json
+          syft dist\launcher.exe -o spdx-json=dist\launcher.sbom.spdx.json
+          syft dist\launcher.exe -o cyclonedx-json=dist\launcher.sbom.cdx.json
+          Compress-Archive -Path dist\launcher.exe, dist\launcher.sbom.syft.json, dist\launcher.sbom.spdx.json, dist\launcher.sbom.cdx.json -DestinationPath launcher-${{ matrix.target }}.zip -Force
+          $sha = (Get-FileHash -Path launcher-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$sha  launcher-${{ matrix.target }}.zip" | Out-File -FilePath launcher-${{ matrix.target }}.zip.sha256 -Encoding ascii
+
+      - name: Upload Binary Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-${{ matrix.target }}
+          path: |
+            launcher-${{ matrix.target }}.*
+
+  sbom:
+    name: Generate Source SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set Version Env
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+          echo "VERSION=$version" >> $GITHUB_ENV
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      - name: Generate SBOM JSON
+        run: |
+          cargo cyclonedx --spec-version 1.5 --format json --override-filename launcher-v${{ env.VERSION }}-bom.cdx
+
+      - name: Calculate SBOM sha256
+        run: |
+          shasum -a 256 launcher-v${{ env.VERSION }}-bom.cdx.json > launcher-v${{ env.VERSION }}-bom.cdx.json.sha256
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-bom-cdx
+          path: launcher-v${{ env.VERSION }}-bom.cdx.json*
+
+  release:
+    name: Publish Release
+    needs: [build-and-package, sbom]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
