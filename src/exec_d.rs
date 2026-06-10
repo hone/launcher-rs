@@ -21,11 +21,13 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 
 /// Errors that can occur during execution of `exec.d` helper binaries.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ExecDError {
     /// Failed to create the OS pipe for process communication.
+    #[error("{0}")]
     CreatePipe(String),
     /// Failed to spawn the `exec.d` child process.
+    #[error("Failed to spawn exec.d binary '{path}': {error}")]
     Spawn {
         /// The path of the binary that failed to spawn.
         path: String,
@@ -33,6 +35,7 @@ pub enum ExecDError {
         error: std::io::Error,
     },
     /// Failed to read output from the communication pipe.
+    #[error("Failed to read {channel} output from exec.d: {error}")]
     ReadOutput {
         /// The underlying I/O error.
         error: std::io::Error,
@@ -40,6 +43,7 @@ pub enum ExecDError {
         channel: &'static str,
     },
     /// Failed to wait for the child process to exit.
+    #[error("Failed to wait for exec.d child process: {error}")]
     Wait {
         /// The path of the binary.
         path: String,
@@ -47,6 +51,7 @@ pub enum ExecDError {
         error: std::io::Error,
     },
     /// The `exec.d` binary exited with a non-zero status.
+    #[error("exec.d binary '{path}' failed with status: {status}")]
     ExecutionFailed {
         /// The path of the binary.
         path: String,
@@ -54,6 +59,7 @@ pub enum ExecDError {
         status: std::process::ExitStatus,
     },
     /// Failed to parse the TOML map returned by the binary.
+    #[error("Failed to decode TOML output from exec.d binary '{path}': {error}\nOutput: '{output}'")]
     Decode {
         /// The path of the binary.
         path: String,
@@ -63,43 +69,6 @@ pub enum ExecDError {
         output: String,
     },
 }
-
-impl std::fmt::Display for ExecDError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExecDError::CreatePipe(msg) => write!(f, "{}", msg),
-            ExecDError::Spawn { path, error } => {
-                write!(f, "Failed to spawn exec.d binary '{}': {}", path, error)
-            }
-            ExecDError::ReadOutput { error, channel } => {
-                write!(
-                    f,
-                    "Failed to read {} output from exec.d: {}",
-                    channel, error
-                )
-            }
-            ExecDError::Wait { path: _, error } => {
-                write!(f, "Failed to wait for exec.d child process: {}", error)
-            }
-            ExecDError::ExecutionFailed { path, status } => {
-                write!(f, "exec.d binary '{}' failed with status: {}", path, status)
-            }
-            ExecDError::Decode {
-                path,
-                error,
-                output,
-            } => {
-                write!(
-                    f,
-                    "Failed to decode TOML output from exec.d binary '{}': {}\nOutput: '{}'",
-                    path, error, output
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ExecDError {}
 
 /// Executes the executable at the given path, capturing environment variables written to File Descriptor 3.
 /// The executable should implement the exec.d interface, writing TOML key-value pairs to FD 3.

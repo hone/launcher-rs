@@ -66,76 +66,29 @@ pub struct RawMetadata {
 }
 
 /// Errors that can occur during the selection and resolution of a CNB application process.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, thiserror::Error)]
 pub enum ProcessSelectionError {
     /// No command-line arguments were provided by the user, and no default process type is defined in the metadata.
+    #[error("determine start command: when there is no default process a command is required")]
     NoCommandAndNoDefault,
     /// The specified process type exists but is ineligible for launch because its execution environment restriction does not match the active environment.
+    #[error("process type '{name}' is not eligible for execution environment '{exec_env}'")]
     IneligibleProcess { name: String, exec_env: String },
     /// The default process type defined in the metadata is ineligible for launch because of execution environment restrictions.
+    #[error("Default process is not eligible for execution environment")]
     IneligibleDefault,
     /// The specified process type is ineligible for launch based on its execution environment restrictions.
+    #[error("Process type '{name}' is not eligible")]
     IneligibleProcessSimple { name: String },
     /// The buildpack metadata associated with the resolved process could not be found.
+    #[error("Buildpack '{bp_id}' not found in metadata for process '{proc_type}'")]
     BuildpackNotFound { bp_id: String, proc_type: String },
     /// The resolved process type has an empty command definition.
+    #[error("Command entries list is empty for process '{proc_type}'")]
     EmptyCommand { proc_type: String },
     /// An error occurred during Buildpack API version verification.
-    BuildpackApi(crate::api::buildpack::BuildpackApiError),
-}
-
-impl std::fmt::Display for ProcessSelectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProcessSelectionError::NoCommandAndNoDefault => {
-                write!(
-                    f,
-                    "determine start command: when there is no default process a command is required"
-                )
-            }
-            ProcessSelectionError::IneligibleProcess { name, exec_env } => {
-                write!(
-                    f,
-                    "process type '{}' is not eligible for execution environment '{}'",
-                    name, exec_env
-                )
-            }
-            ProcessSelectionError::IneligibleDefault => {
-                write!(
-                    f,
-                    "Default process is not eligible for execution environment"
-                )
-            }
-            ProcessSelectionError::IneligibleProcessSimple { name } => {
-                write!(f, "Process type '{}' is not eligible", name)
-            }
-            ProcessSelectionError::BuildpackNotFound { bp_id, proc_type } => {
-                write!(
-                    f,
-                    "Buildpack '{}' not found in metadata for process '{}'",
-                    bp_id, proc_type
-                )
-            }
-            ProcessSelectionError::EmptyCommand { proc_type } => {
-                write!(
-                    f,
-                    "Command entries list is empty for process '{}'",
-                    proc_type
-                )
-            }
-            ProcessSelectionError::BuildpackApi(err) => {
-                write!(f, "{}", err)
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProcessSelectionError {}
-
-impl From<crate::api::buildpack::BuildpackApiError> for ProcessSelectionError {
-    fn from(err: crate::api::buildpack::BuildpackApiError) -> Self {
-        ProcessSelectionError::BuildpackApi(err)
-    }
+    #[error(transparent)]
+    BuildpackApi(#[from] crate::api::buildpack::BuildpackApiError),
 }
 
 /// A fully resolved, version-agnostic domain process model.

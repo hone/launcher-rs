@@ -46,9 +46,10 @@ pub const LAUNCH_ENV_EXCLUDELIST: &[&str] = &[
 ];
 
 /// Errors that can occur when processing the launch environment.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LaunchEnvError {
     /// Failed to canonicalize a layer directory path.
+    #[error("Canonicalize layer dir '{path}': {error}")]
     Canonicalize {
         /// The path that failed canonicalization.
         path: String,
@@ -56,6 +57,7 @@ pub enum LaunchEnvError {
         error: std::io::Error,
     },
     /// Failed to list the contents of an environment directory.
+    #[error("List env dir '{path}': {error}")]
     ListDir {
         /// The directory path that failed to list.
         path: String,
@@ -63,6 +65,7 @@ pub enum LaunchEnvError {
         error: std::io::Error,
     },
     /// Failed to read the contents of an environment variable file.
+    #[error("Read env file '{path}': {error}")]
     ReadFile {
         /// The file path that failed to read.
         path: String,
@@ -70,24 +73,6 @@ pub enum LaunchEnvError {
         error: std::io::Error,
     },
 }
-
-impl std::fmt::Display for LaunchEnvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LaunchEnvError::Canonicalize { path, error } => {
-                write!(f, "Canonicalize layer dir '{}': {}", path, error)
-            }
-            LaunchEnvError::ListDir { path, error } => {
-                write!(f, "List env dir '{}': {}", path, error)
-            }
-            LaunchEnvError::ReadFile { path, error } => {
-                write!(f, "Read env file '{}': {}", path, error)
-            }
-        }
-    }
-}
-
-impl std::error::Error for LaunchEnvError {}
 
 /// Encapsulates the execution environment variables and layer-sourcing modifications for the launch process.
 pub struct LaunchEnv {

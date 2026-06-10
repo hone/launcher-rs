@@ -98,11 +98,13 @@ fn main() {
 }
 
 /// Errors that can occur during the execution of the launcher binary.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
     /// Error verifying the Platform API.
+    #[error(transparent)]
     PlatformApi(api::platform::PlatformApiError),
     /// Error verifying a buildpack API version.
+    #[error("failed to set API for buildpack '{bp_id}': {error}")]
     SetBuildpackApi {
         /// The identifier of the buildpack.
         bp_id: String,
@@ -110,12 +112,16 @@ pub enum LaunchError {
         error: api::buildpack::BuildpackApiError,
     },
     /// Error building the launch environment.
+    #[error("failed to launch: {0}")]
     LaunchEnv(Box<env::LaunchEnvError>),
     /// Error executing an `exec.d` initialization script.
+    #[error("failed to launch: {0}")]
     ExecD(Box<exec_d::ExecDError>),
     /// Error resolving or selecting the process to execute.
+    #[error("failed to launch: {0}")]
     ProcessSelection(Box<launch::ProcessSelectionError>),
     /// Failed to change the current working directory to the app directory.
+    #[error("failed to launch: change to app directory: {error}")]
     ChangeAppDir {
         /// The targeted application path.
         path: String,
@@ -123,11 +129,13 @@ pub enum LaunchError {
         error: std::io::Error,
     },
     /// The `metadata.toml` configuration file was not found.
+    #[error("failed to read metadata: metadata file not found at '{path}'")]
     MetadataNotFound {
         /// The expected path of `metadata.toml`.
         path: String,
     },
     /// Failed to read the `metadata.toml` configuration file.
+    #[error("failed to read metadata: {error}")]
     MetadataRead {
         /// The path of the file.
         path: String,
@@ -135,11 +143,13 @@ pub enum LaunchError {
         error: std::io::Error,
     },
     /// Failed to parse the `metadata.toml` configuration file.
+    #[error("failed to read metadata: parse failed: {error}")]
     MetadataParse {
         /// The TOML parsing error.
         error: toml::de::Error,
     },
     /// Failed to list the subdirectories of a buildpack layer directory.
+    #[error("failed to launch: {context}: {error}")]
     ListLayerDirs {
         /// Context string describing what was being listed.
         context: String,
@@ -147,6 +157,7 @@ pub enum LaunchError {
         error: std::io::Error,
     },
     /// Failed to list the files in a layer subdirectory (e.g. `exec.d` or `profile.d`).
+    #[error("failed to launch: {context}: {error}")]
     ListLayerFiles {
         /// Context string describing what was being listed.
         context: String,
@@ -154,79 +165,12 @@ pub enum LaunchError {
         error: std::io::Error,
     },
     /// Direct process replacement execution failed.
+    #[error("failed to launch: direct exec: {0}")]
     DirectExec(std::io::Error),
     /// Indirect shell-wrapped execution failed.
+    #[error("failed to launch: bash exec: {0}")]
     BashExec(std::io::Error),
 }
-
-impl std::fmt::Display for LaunchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let prefix = match self {
-            LaunchError::PlatformApi(_)
-            | LaunchError::SetBuildpackApi { .. }
-            | LaunchError::MetadataNotFound { .. }
-            | LaunchError::MetadataRead { .. }
-            | LaunchError::MetadataParse { .. } => "failed to",
-            _ => "failed to launch:",
-        };
-
-        match self {
-            LaunchError::PlatformApi(api::platform::PlatformApiError::Empty) => {
-                write!(
-                    f,
-                    "{} get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version",
-                    prefix
-                )
-            }
-            LaunchError::PlatformApi(api::platform::PlatformApiError::Invalid(v)) => {
-                write!(f, "{} parse platform API '{}'", prefix, v)
-            }
-            LaunchError::PlatformApi(api::platform::PlatformApiError::Incompatible(v)) => {
-                write!(
-                    f,
-                    "{} set platform API: platform API version '{}' is incompatible with the lifecycle",
-                    prefix, v
-                )
-            }
-            LaunchError::SetBuildpackApi { bp_id, error } => {
-                write!(f, "{} set API for buildpack '{}': {}", prefix, bp_id, error)
-            }
-            LaunchError::LaunchEnv(err) => write!(f, "{} {}", prefix, err),
-            LaunchError::ExecD(err) => write!(f, "{} {}", prefix, err),
-            LaunchError::ProcessSelection(err) => write!(f, "{} {}", prefix, err),
-            LaunchError::ChangeAppDir { path: _, error } => {
-                write!(f, "{} change to app directory: {}", prefix, error)
-            }
-            LaunchError::MetadataNotFound { path } => {
-                write!(
-                    f,
-                    "{} read metadata: metadata file not found at '{}'",
-                    prefix, path
-                )
-            }
-            LaunchError::MetadataRead { path: _, error } => {
-                write!(f, "{} read metadata: {}", prefix, error)
-            }
-            LaunchError::MetadataParse { error } => {
-                write!(f, "{} read metadata: parse failed: {}", prefix, error)
-            }
-            LaunchError::ListLayerDirs { context, error } => {
-                write!(f, "{} {}: {}", prefix, context, error)
-            }
-            LaunchError::ListLayerFiles { context, error } => {
-                write!(f, "{} {}: {}", prefix, context, error)
-            }
-            LaunchError::DirectExec(error) => {
-                write!(f, "{} direct exec: {}", prefix, error)
-            }
-            LaunchError::BashExec(error) => {
-                write!(f, "{} bash exec: {}", prefix, error)
-            }
-        }
-    }
-}
-
-impl std::error::Error for LaunchError {}
 
 impl LaunchError {
     pub fn code(&self) -> ExitCode {

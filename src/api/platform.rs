@@ -25,28 +25,21 @@ pub const SUPPORTED_PLATFORM_APIS: &[Version] = &[
 pub const DEPRECATED_PLATFORM_APIS: &[Version] = &[];
 
 /// Errors that can occur during Platform API verification.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PlatformApiError {
     /// The requested Platform API version string was empty.
+    #[error(
+        "failed to get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version"
+    )]
     Empty,
     /// Failed to parse the Platform API version string.
+    #[error("failed to parse platform API '{0}'")]
     Invalid(String),
     /// The parsed Platform API version is not supported by this lifecycle launcher.
+    #[error(
+        "failed to set platform API: platform API version '{0}' is incompatible with the lifecycle"
+    )]
     Incompatible(String),
-}
-
-impl std::fmt::Display for PlatformApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlatformApiError::Empty => write!(f, "Platform API version is empty"),
-            PlatformApiError::Invalid(v) => write!(f, "parse platform API '{}'", v),
-            PlatformApiError::Incompatible(v) => write!(
-                f,
-                "platform API version '{}' is incompatible with the lifecycle",
-                v
-            ),
-        }
-    }
 }
 
 /// Verifies whether the requested Platform API version string is supported.

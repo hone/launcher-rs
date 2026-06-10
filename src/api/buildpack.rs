@@ -21,9 +21,10 @@ pub const SUPPORTED_BUILDPACK_APIS: &[Version] = &[
 pub const DEPRECATED_BUILDPACK_APIS: &[Version] = &[];
 
 /// Errors that can occur during Buildpack API verification.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, thiserror::Error)]
 pub enum BuildpackApiError {
     /// Failed to parse the Buildpack API version string.
+    #[error("Parse buildpack API '{version}' for buildpack '{bp_id}': {error}")]
     Parse {
         /// The identifier of the buildpack.
         bp_id: String,
@@ -33,6 +34,9 @@ pub enum BuildpackApiError {
         error: String,
     },
     /// The Buildpack API version is not supported by this lifecycle launcher.
+    #[error(
+        "buildpack API version '{version}' is incompatible with the lifecycle for buildpack '{bp_id}'"
+    )]
     Incompatible {
         /// The identifier of the buildpack.
         bp_id: String,
@@ -40,33 +44,6 @@ pub enum BuildpackApiError {
         version: String,
     },
 }
-
-impl std::fmt::Display for BuildpackApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BuildpackApiError::Parse {
-                bp_id,
-                version,
-                error,
-            } => {
-                write!(
-                    f,
-                    "Parse buildpack API '{}' for buildpack '{}': {}",
-                    version, bp_id, error
-                )
-            }
-            BuildpackApiError::Incompatible { bp_id, version } => {
-                write!(
-                    f,
-                    "buildpack API version '{}' is incompatible with the lifecycle for buildpack '{}'",
-                    version, bp_id
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for BuildpackApiError {}
 
 /// Verifies whether the requested Buildpack API version string is supported.
 ///
