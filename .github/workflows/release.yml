@@ -39,7 +39,7 @@ jobs:
             os: windows-latest
             suffix: windows.x86-64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -108,7 +108,7 @@ jobs:
     name: Generate Source SBOM
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Set Version Env
         run: |
