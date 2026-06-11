@@ -610,3 +610,80 @@ mod main_tests {
         assert_eq!(list[2], file_c.to_string_lossy().into_owned());
     }
 }
+
+#[cfg(test)]
+mod ported_rust_tests {
+    use super::*;
+
+    // Mirrors launcher-rust escape_id behavior (Go EscapeID): every '/' in a
+    // buildpack id is rewritten to '_' to produce the on-disk layer folder name.
+    #[test]
+    fn escape_id_slash_to_underscore() {
+        // Single slash -> single underscore.
+        assert_eq!(escape_id("heroku/ruby"), "heroku_ruby");
+        // Every slash is replaced, not just the first.
+        assert_eq!(escape_id("a/b/c/d"), "a_b_c_d");
+        // An id with no slash is returned unchanged.
+        assert_eq!(escape_id("plain-id"), "plain-id");
+    }
+
+    // Mirrors launcher-rust profile.d accumulation: files in a directory are
+    // appended to the list in ascending alphabetical (sorted) order, regardless
+    // of the order they were created on disk. Go iterates a sorted listing.
+    #[test]
+    fn accumulate_files_sorted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+
+        // Create files in non-alphabetical creation order.
+        let file_c = path.join("c.sh");
+        let file_a = path.join("a.sh");
+        let file_b = path.join("b.sh");
+        fs::write(&file_c, "echo c").unwrap();
+        fs::write(&file_a, "echo a").unwrap();
+        fs::write(&file_b, "echo b").unwrap();
+
+        let mut list = Vec::new();
+        accumulate_files_in_dir(path, &mut list).unwrap();
+
+        // The accumulated list must be sorted ascending by path.
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], file_a.to_string_lossy().into_owned());
+        assert_eq!(list[1], file_b.to_string_lossy().into_owned());
+        assert_eq!(list[2], file_c.to_string_lossy().into_owned());
+    }
+
+    // Mirrors launcher-rust format_error: the rendered message carries the
+    // "ERROR: " prefix (Go DefaultLogger error prefix). The non-colorized form
+    // is exactly "ERROR: <msg>"; the colorized form embeds the same prefix
+    // between ANSI bold-red escape sequences.
+    #[test]
+    fn format_error_contains_prefix() {
+        // Non-colorized: exact "ERROR: " prefix + message.
+        let plain = format_error("boom", false);
+        assert_eq!(plain, "ERROR: boom");
+        assert!(plain.starts_with("ERROR: "));
+
+        // Colorized: the "ERROR: " prefix is still present (within ANSI codes).
+        let colored = format_error("boom", true);
+        assert_eq!(colored, "\x1b[31;1mERROR: \x1b[0mboom");
+        assert!(colored.contains("ERROR: "));
+    }
+
+    // Mirrors launcher-rust format_warning: the rendered message carries the
+    // "Warning: " prefix (Go DefaultLogger warning prefix). The non-colorized
+    // form is exactly "Warning: <msg>"; the colorized form embeds the same
+    // prefix between ANSI bold-yellow escape sequences.
+    #[test]
+    fn format_warning_contains_prefix() {
+        // Non-colorized: exact "Warning: " prefix + message.
+        let plain = format_warning("careful", false);
+        assert_eq!(plain, "Warning: careful");
+        assert!(plain.starts_with("Warning: "));
+
+        // Colorized: the "Warning: " prefix is still present (within ANSI codes).
+        let colored = format_warning("careful", true);
+        assert_eq!(colored, "\x1b[33;1mWarning: \x1b[0mcareful");
+        assert!(colored.contains("Warning: "));
+    }
+}

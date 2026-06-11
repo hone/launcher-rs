@@ -298,3 +298,198 @@ echo 'MY_NEW_VAR = "injected_value"' >&3
         assert_eq!(vars.get("MY_NEW_VAR").unwrap(), "injected_value");
     }
 }
+
+// ===========================================================================
+// Ported from launcher-rust src/launch/exec_d.rs #[cfg(test)] mod tests.
+// Appended as a self-contained module owning a unique name so it does not
+// collide with the file's existing `mod tests`.
+//
+// launcher-rs's `run_exec_d` is only defined under #[cfg(unix)] (it returns
+// the parsed map; the Windows variant has a different code path but the same
+// signature). These behavioral tests spawn shell scripts via FD3 so they are
+// unix-gated to match where `run_exec_d` + the shell helpers exist.
+// ===========================================================================
+#[cfg(all(test, unix))]
+mod ported_rust_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, body).unwrap();
+        let mut perm = fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&p, perm).unwrap();
+        p
+    }
+
+    fn empty_env() -> LaunchEnv {
+        // Construct a LaunchEnv with no inherited host vars, mirroring Go's
+        // `env.List()` empty starting point.
+        LaunchEnv::new(std::iter::empty(), "", "")
+    }
+
+    // Mirrors launcher-rust `sets_env_var_from_fd3_toml`.
+    // Go-correct: FD3 `FOO = "bar"` yields FOO=bar. launcher-rs returns the
+    // parsed map (it does not mutate env), so assert on the returned map.
+    #[test]
+    fn sets_env_var_from_fd3_toml() {
+        let dir = tempdir().unwrap();
+        let bin = write_script(
+            dir.path(),
+            "execd",
+            "#!/bin/sh\nprintf 'FOO = \"bar\"\\n' >&3\n",
+        );
+        let env = empty_env();
+        let vars = run_exec_d(&bin, &env).unwrap();
+        assert_eq!(vars.get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    // Mirrors launcher-rust `empty_fd3_output_is_ok`.
+    // Go-correct: empty FD3 -> Ok, preset env preserved. launcher-rs returns
+    // Ok(empty map) and never touches env, so a preset value survives.
+    #[test]
+    fn empty_fd3_output_is_ok() {
+        let dir = tempdir().unwrap();
+        let bin = write_script(dir.path(), "execd", "#!/bin/sh\n# write nothing to fd3\n");
+        let mut env = empty_env();
+        env.set("PRESET", "keep");
+        let vars = run_exec_d(&bin, &env).unwrap();
+        assert!(vars.is_empty(), "expected empty map, got {:?}", vars);
+        assert_eq!(env.get("PRESET").map(String::as_str), Some("keep"));
+    }
+
+    // Mirrors launcher-rust `multiple_vars_all_set`.
+    // Go-correct: both FOO and BAZ set.
+    #[test]
+    fn multiple_vars_all_set() {
+        let dir = tempdir().unwrap();
+        let bin = write_script(
+            dir.path(),
+            "execd",
+            "#!/bin/sh\nprintf 'FOO = \"bar\"\\nBAZ = \"qux\"\\n' >&3\n",
+        );
+        let env = empty_env();
+        let vars = run_exec_d(&bin, &env).unwrap();
+        assert_eq!(vars.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(vars.get("BAZ").map(String::as_str), Some("qux"));
+    }
+
+    // GAP: launcher-rs's run_exec_d takes `&LaunchEnv` and RETURNS a
+    // HashMap; it never mutates `env`. Go's ExecD calls env.Set(k, v) per
+    // entry (lifecycle/launch/exec_d.go), and launcher-rust mirrors that by
+    // mutating its `&mut Env`. Go-correct expectation: after the call, `env`
+    // itself reflects FOO=bar. launcher-rs leaves `env` untouched, so this
+    // assertion FAILS (divergence: returns-map vs mutates-env).
+    #[test]
+    fn port_run_exec_d_mutates_env_like_go() {
+        let dir = tempdir().unwrap();
+        let bin = write_script(
+            dir.path(),
+            "execd",
+            "#!/bin/sh\nprintf 'FOO = \"bar\"\\n' >&3\n",
+        );
+        let env = empty_env();
+        let _ = run_exec_d(&bin, &env).unwrap();
+        // Go-faithful: env IS mutated. launcher-rs does not mutate -> FAILS.
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    // GAP: launcher-rust's non-zero-exit error message is
+    // "failed to execute exec.d file at path '<path>': <code>". launcher-rs's
+    // ExecDError::ExecutionFailed Display is
+    // "exec.d binary '<path>' failed with status: <status>" (exec_d.rs:54).
+    // The structural variant match always holds and the path is present, but
+    // the Go-faithful message wording assertion FAILS (divergence: error
+    // message format).
+    #[test]
+    fn port_nonzero_exit_returns_error_with_path() {
+        let dir = tempdir().unwrap();
+        let bin = write_script(dir.path(), "execd", "#!/bin/sh\nexit 7\n");
+        let env = empty_env();
+        let err = run_exec_d(&bin, &env).expect_err("expected error from non-zero exit");
+        // Structural check (always holds against launcher-rs).
+        assert!(
+            matches!(err, ExecDError::ExecutionFailed { .. }),
+            "expected ExecutionFailed, got {:?}",
+            err
+        );
+        let msg = err.to_string();
+        // Go-faithful wording -> FAILS against launcher-rs wording.
+        assert!(
+            msg.contains("failed to execute exec.d file at path"),
+            "{}",
+            msg
+        );
+        assert!(msg.contains(&bin.display().to_string()), "{}", msg);
+    }
+
+    // GAP: launcher-rust's decode error message is
+    // "failed to decode output from exec.d file at path '<path>': <err>".
+    // launcher-rs's ExecDError::Decode Display is
+    // "Failed to decode TOML output from exec.d binary '<path>': <err>..."
+    // (exec_d.rs:62-64). The structural Decode variant match holds, but the
+    // Go-faithful message wording assertion FAILS (divergence: error message
+    // format).
+    #[test]
+    fn port_invalid_toml_returns_decode_error() {
+        let dir = tempdir().unwrap();
+        let bin = write_script(
+            dir.path(),
+            "execd",
+            "#!/bin/sh\nprintf 'this is not toml = =\\n' >&3\n",
+        );
+        let env = empty_env();
+        let err = run_exec_d(&bin, &env).expect_err("expected decode error");
+        // Structural check (always holds against launcher-rs).
+        assert!(
+            matches!(err, ExecDError::Decode { .. }),
+            "expected Decode, got {:?}",
+            err
+        );
+        let msg = err.to_string();
+        // Go-faithful wording -> FAILS against launcher-rs wording.
+        assert!(
+            msg.contains("failed to decode output from exec.d file at path"),
+            "{}",
+            msg
+        );
+    }
+
+    // GAP: Go sets `cmd.Env = env.List()` (full replacement: the child sees
+    // ONLY env's vars), and launcher-rust mirrors this with `.env_clear()`.
+    // launcher-rs uses `cmd.envs(env.vars())` with NO env_clear (exec_d.rs:92),
+    // so the parent process environment LEAKS into the exec.d child.
+    // Go-correct: a parent-only var must NOT be visible to the child, so the
+    // script reports SEEN="no". launcher-rs leaks it -> SEEN="yes" and this
+    // assertion FAILS (divergence: missing env_clear).
+    #[test]
+    fn port_child_env_is_cleared_like_go() {
+        let marker = "PORT_EXECD_LEAK_MARKER";
+        // SAFETY: single-threaded test setup; value read by the child only.
+        unsafe { std::env::set_var(marker, "leaked") };
+
+        let dir = tempdir().unwrap();
+        // The script reports whether the marker is visible, via FD3 TOML.
+        let body = format!(
+            "#!/bin/sh\nif [ -n \"${{{m}}}\" ]; then printf 'SEEN = \"yes\"\\n' >&3; else printf 'SEEN = \"no\"\\n' >&3; fi\n",
+            m = marker
+        );
+        let bin = write_script(dir.path(), "execd", &body);
+
+        // empty_env() carries none of the host vars, mirroring Go's env.List().
+        let env = empty_env();
+        let vars = run_exec_d(&bin, &env).unwrap();
+        unsafe { std::env::remove_var(marker) };
+
+        // Go-faithful: child env is fully controlled by env, so the parent
+        // marker is invisible. launcher-rs leaks it -> SEEN == "yes" -> FAILS.
+        assert_eq!(
+            vars.get("SEEN").map(String::as_str),
+            Some("no"),
+            "exec.d child saw a leaked parent env var (no env_clear)"
+        );
+    }
+}

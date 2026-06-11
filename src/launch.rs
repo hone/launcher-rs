@@ -686,3 +686,381 @@ mod tests {
         assert_eq!(res.working_directory, "/workspace");
     }
 }
+
+#[cfg(test)]
+mod ported_rust_tests {
+    use super::*;
+
+    // Helpers mirroring the launcher-rust fixtures, adapted to launcher-rs's
+    // RawProcess (which has NO Default impl: every field must be specified).
+
+    fn sv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Build a RawProcess with all fields explicit. launcher-rs's RawProcess has
+    /// no Default, so this mirrors launcher-rust's struct-literal fixtures.
+    fn raw_proc(
+        proc_type: &str,
+        command: RawCommand,
+        args: Option<Vec<String>>,
+        buildpack_id: &str,
+        exec_env: Option<Vec<String>>,
+    ) -> RawProcess {
+        RawProcess {
+            proc_type: proc_type.to_string(),
+            command,
+            args,
+            direct: false,
+            default: false,
+            buildpack_id: buildpack_id.to_string(),
+            working_dir: None,
+            exec_env,
+        }
+    }
+
+    // ---------- ResolvedProcess::from_user ----------
+    // Mirrors launcher-rust src/launch/process.rs userProvidedProcess behavior:
+    // a leading "--" marker yields a DIRECT process and splits command/args.
+
+    #[test]
+    fn from_user_direct_marker_splits() {
+        let cmd = sv(&["--", "node", "index.js", "extra"]);
+        let proc = ResolvedProcess::from_user(&cmd, "/workspace").unwrap();
+        assert!(proc.direct);
+        assert_eq!(proc.command, "node");
+        assert_eq!(proc.args, sv(&["index.js", "extra"]));
+        assert_eq!(proc.working_directory, "/workspace");
+    }
+
+    #[test]
+    fn from_user_shell_when_no_marker() {
+        let cmd = sv(&["node", "index.js"]);
+        let proc = ResolvedProcess::from_user(&cmd, "/workspace").unwrap();
+        assert!(!proc.direct);
+        assert_eq!(proc.command, "node");
+        assert_eq!(proc.args, sv(&["index.js"]));
+        assert_eq!(proc.working_directory, "/workspace");
+    }
+
+    // ---------- ResolvedProcess::from_metadata: eligibility & arg merge ----------
+
+    #[test]
+    fn from_metadata_eligible_direct() {
+        // Eligible: exec-env=["production"] under exec_env "production", platform >= 0.15.
+        // Go-correct: returns Some(resolved) preserving the direct flag.
+        let raw = RawProcess {
+            proc_type: "web".to_string(),
+            command: RawCommand::Array(vec!["node".to_string(), "server.js".to_string()]),
+            args: Some(sv(&["--port", "8080"])),
+            direct: true,
+            default: true,
+            buildpack_id: "my-bp".to_string(),
+            working_dir: Some("/app".to_string()),
+            exec_env: Some(sv(&["production"])),
+        };
+        let bps = vec![RawBuildpack {
+            id: "my-bp".to_string(),
+            api: "0.12".to_string(),
+        }];
+        let resolved =
+            ResolvedProcess::from_metadata(&raw, &bps, &Version::new(0, 15), "production", &[])
+                .unwrap()
+                .expect("process should be eligible");
+        assert_eq!(resolved.proc_type, "web");
+        assert_eq!(resolved.command, "node");
+        assert!(resolved.direct);
+        // platform >= 0.10, multi-entry command: entries[1..] always-provided, then
+        // overridable defaults appended because user_args is empty.
+        assert_eq!(resolved.args, sv(&["server.js", "--port", "8080"]));
+        assert_eq!(resolved.working_directory, "/app");
+    }
+
+    #[test]
+    fn from_metadata_bp_lt09_appends_args() {
+        // Single-entry command, buildpack API 0.8 (< 0.9), platform >= 0.10 with user args.
+        // Go-correct: user args are APPENDED to the process default args.
+        let raw = raw_proc(
+            "web",
+            RawCommand::Single("node".to_string()),
+            Some(sv(&["server.js"])),
+            "my-bp",
+            None,
+        );
+        let bps = vec![RawBuildpack {
+            id: "my-bp".to_string(),
+            api: "0.8".to_string(),
+        }];
+        let resolved = ResolvedProcess::from_metadata(
+            &raw,
+            &bps,
+            &Version::new(0, 10),
+            "production",
+            &sv(&["user-arg"]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.command, "node");
+        assert_eq!(resolved.args, sv(&["server.js", "user-arg"]));
+    }
+
+    #[test]
+    fn from_metadata_bp_ge09_replaces_args() {
+        // Single-entry command, buildpack API 0.9 (>= 0.9), platform >= 0.10 with user args.
+        // Go-correct: user args REPLACE the process default args.
+        let raw = raw_proc(
+            "web",
+            RawCommand::Single("node".to_string()),
+            Some(sv(&["server.js"])),
+            "my-bp",
+            None,
+        );
+        let bps = vec![RawBuildpack {
+            id: "my-bp".to_string(),
+            api: "0.9".to_string(),
+        }];
+        let resolved = ResolvedProcess::from_metadata(
+            &raw,
+            &bps,
+            &Version::new(0, 10),
+            "production",
+            &sv(&["user-arg"]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.command, "node");
+        assert_eq!(resolved.args, sv(&["user-arg"]));
+    }
+
+    // ---------- RawCommand parsing (launch.toml / metadata.toml schema) ----------
+    // Mirrors launcher-rust src/launch/metadata.rs RawCommand deserialize tests:
+    // a bare string and an array of strings must both parse into command entries.
+
+    #[test]
+    fn command_as_string_parses() {
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            command: RawCommand,
+        }
+        // launcher-rs RawCommand is #[serde(untagged)] Single(String) | Array(Vec<String>).
+        let h: Holder = serde_json::from_str(r#"{"command": "bash run.sh"}"#).unwrap();
+        match h.command {
+            RawCommand::Single(s) => assert_eq!(s, "bash run.sh"),
+            RawCommand::Array(a) => panic!("expected Single, got Array({a:?})"),
+        }
+    }
+
+    #[test]
+    fn command_as_list_parses() {
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            command: RawCommand,
+        }
+        let h: Holder = serde_json::from_str(r#"{"command": ["bash", "run.sh"]}"#).unwrap();
+        match h.command {
+            RawCommand::Array(a) => assert_eq!(a, sv(&["bash", "run.sh"])),
+            RawCommand::Single(s) => panic!("expected Array, got Single({s:?})"),
+        }
+    }
+
+    // ---------- Working directory default to app_dir ----------
+    // launcher-rs has NO standalone get_process_working_directory fn; the fallback
+    // to app_dir is inlined in ProcessSelector::select (launch.rs:406). Mirror the
+    // launcher-rust working_dir_falls_back_to_app_dir_when_unset intent through select().
+
+    #[test]
+    fn process_working_dir_defaults_appdir() {
+        // Process with no working-dir; argv0 basename selects it (symlink rule).
+        let raw = raw_proc(
+            "web",
+            RawCommand::Single("node".to_string()),
+            None,
+            "my-bp",
+            None,
+        );
+        let metadata = RawMetadata {
+            processes: vec![raw],
+            buildpacks: vec![RawBuildpack {
+                id: "my-bp".to_string(),
+                api: "0.12".to_string(),
+            }],
+        };
+        let platform_api = Version::new(0, 15);
+        let selector = ProcessSelector {
+            args: &sv(&["web"]),
+            metadata: &metadata,
+            platform_api: &platform_api,
+            exec_env: "production",
+            app_dir: "/workspace",
+        };
+        let resolved = selector.select().unwrap();
+        assert_eq!(resolved.proc_type, "web");
+        assert_eq!(resolved.working_directory, "/workspace");
+    }
+
+    // ---------- Exec-env filtering ----------
+
+    #[test]
+    fn exec_env_specific_match() {
+        // exec-env=["production"], platform >= 0.15, exec_env "production" -> eligible (Some).
+        let raw = raw_proc(
+            "prod-only",
+            RawCommand::Single("prod-command".to_string()),
+            None,
+            "my-bp",
+            Some(sv(&["production"])),
+        );
+        let bps = vec![RawBuildpack {
+            id: "my-bp".to_string(),
+            api: "0.12".to_string(),
+        }];
+        let resolved =
+            ResolvedProcess::from_metadata(&raw, &bps, &Version::new(0, 15), "production", &[])
+                .unwrap();
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap().proc_type, "prod-only");
+
+        // The same process under a non-matching exec_env is ineligible (Ok(None)).
+        let ineligible =
+            ResolvedProcess::from_metadata(&raw, &bps, &Version::new(0, 15), "test", &[]).unwrap();
+        assert!(ineligible.is_none());
+    }
+
+    #[test]
+    fn exec_env_no_env_is_wildcard() {
+        // No exec-env specified -> matches any execution environment (incl. empty).
+        let raw = raw_proc(
+            "web",
+            RawCommand::Single("node".to_string()),
+            None,
+            "my-bp",
+            None,
+        );
+        let bps = vec![RawBuildpack {
+            id: "my-bp".to_string(),
+            api: "0.12".to_string(),
+        }];
+        let platform = Version::new(0, 15);
+        assert!(
+            ResolvedProcess::from_metadata(&raw, &bps, &platform, "test", &[])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ResolvedProcess::from_metadata(&raw, &bps, &platform, "production", &[])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ResolvedProcess::from_metadata(&raw, &bps, &platform, "", &[])
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // ---------- ProcessSelector: single-arg / argv0 process-type lookup ----------
+
+    #[test]
+    fn single_arg_process_type_lookup() {
+        // Rule 1: argv0 basename matches a process type (symlink execution).
+        let raw_web = raw_proc(
+            "web",
+            RawCommand::Single("node".to_string()),
+            Some(sv(&["server.js"])),
+            "my-bp",
+            None,
+        );
+        let raw_worker = raw_proc(
+            "worker",
+            RawCommand::Single("node".to_string()),
+            Some(sv(&["worker.js"])),
+            "my-bp",
+            None,
+        );
+        let metadata = RawMetadata {
+            processes: vec![raw_web, raw_worker],
+            buildpacks: vec![RawBuildpack {
+                id: "my-bp".to_string(),
+                api: "0.12".to_string(),
+            }],
+        };
+        let platform_api = Version::new(0, 15);
+        let selector = ProcessSelector {
+            args: &sv(&["/usr/local/bin/worker", "--flag"]),
+            metadata: &metadata,
+            platform_api: &platform_api,
+            exec_env: "test",
+            app_dir: "/workspace",
+        };
+        let resolved = selector.select().unwrap();
+        assert_eq!(resolved.proc_type, "worker");
+        // Buildpack API 0.12 (>= 0.9): user args replace default args.
+        assert_eq!(resolved.args, sv(&["--flag"]));
+        assert_eq!(resolved.working_directory, "/workspace");
+    }
+
+    // ---------- GAP tests (Go-correct assertions that launcher-rs violates) ----------
+
+    // GAP: launcher-rust treats a non-empty buildpack_id that matches NO buildpack as
+    // pre-0.9 (bp_api None -> APPEND user args), so args == ["a","u1"]. launcher-rs
+    // instead returns Err(ProcessSelectionError::BuildpackNotFound) when buildpack_id
+    // is present but absent from the buildpacks list, so the first .unwrap() panics.
+    // This test asserts the Go-correct value and is expected to FAIL against launcher-rs.
+    #[test]
+    fn unknown_buildpack_id_treated_as_pre_09() {
+        let raw = raw_proc(
+            "lonely",
+            RawCommand::Single("cmd".to_string()),
+            Some(sv(&["a"])),
+            "nonexistent",
+            None,
+        );
+        let resolved =
+            ResolvedProcess::from_metadata(&raw, &[], &Version::new(0, 15), "", &sv(&["u1"]))
+                .unwrap()
+                .unwrap();
+        assert_eq!(resolved.args, sv(&["a", "u1"]));
+    }
+
+    // GAP: launcher-rust scans for the FIRST ELIGIBLE process of a given type, so with
+    // two "duplicate" processes (production then test) under exec_env="test" it selects
+    // the test one (command == "test-version"). launcher-rs's ProcessSelector::select
+    // uses processes.iter().find(|p| p.proc_type == name) which returns the FIRST
+    // POSITIONAL "duplicate" (production), then from_metadata returns Ok(None) for
+    // exec_env="test", so select() maps to Err(IneligibleProcess) and .unwrap() panics.
+    // This test asserts the Go-correct value and is expected to FAIL against launcher-rs.
+    #[test]
+    fn exec_env_duplicate_types_picks_first_eligible() {
+        let prod = raw_proc(
+            "duplicate",
+            RawCommand::Single("prod-version".to_string()),
+            None,
+            "some-buildpack",
+            Some(sv(&["production"])),
+        );
+        let test = raw_proc(
+            "duplicate",
+            RawCommand::Single("test-version".to_string()),
+            None,
+            "some-buildpack",
+            Some(sv(&["test"])),
+        );
+        let metadata = RawMetadata {
+            processes: vec![prod, test],
+            buildpacks: vec![RawBuildpack {
+                id: "some-buildpack".to_string(),
+                api: "0.8".to_string(),
+            }],
+        };
+        let platform_api = Version::new(0, 15);
+        let selector = ProcessSelector {
+            args: &sv(&["duplicate"]),
+            metadata: &metadata,
+            platform_api: &platform_api,
+            exec_env: "test",
+            app_dir: "/workspace",
+        };
+        let resolved = selector.select().unwrap();
+        assert_eq!(resolved.command, "test-version");
+    }
+}

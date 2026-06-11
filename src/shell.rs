@@ -241,3 +241,66 @@ mod tests {
         assert_eq!(escape_msvc_arg("a \\"), "\"a \\\\\"");
     }
 }
+
+#[cfg(test)]
+mod ported_rust_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // Ported from launcher-rust src/launch/bash.rs::tokens_n1 (and the existing
+    // launcher-rs test_bash_command_with_tokens n=1 pin). Mirrors Go
+    // bashCommandWithTokens(1): a single $0 token, byte-for-byte.
+    #[test]
+    fn bash_command_with_tokens_n1() {
+        assert_eq!(
+            bash_command_with_tokens(1),
+            "exec bash -c '\"$(eval echo \\\"$0\\\")\"' \"${@:1}\""
+        );
+    }
+
+    // Ported from launcher-rust src/launch/bash.rs::tokens_n3. Mirrors Go
+    // bashCommandWithTokens(3): $0 plus ${1} ${2} eval-echo tokens, byte-for-byte.
+    #[test]
+    fn bash_command_with_tokens_n3() {
+        assert_eq!(
+            bash_command_with_tokens(3),
+            "exec bash -c '\"$(eval echo \\\"$0\\\")\" \"$(eval echo \\\"${1}\\\")\" \"$(eval echo \\\"${2}\\\")\"' \"${@:1}\""
+        );
+    }
+
+    // Ported (boundary variant) from launcher-rust src/launch/bash.rs token tests.
+    // For n_tokens=0 the per-token loop `1..0` is empty, so the script degenerates
+    // to the single $0 token form -- identical output to n=1. Go's
+    // bashCommandWithTokens has the same `for i := 1; i < nTokens` boundary.
+    #[test]
+    fn bash_command_with_tokens_n0() {
+        assert_eq!(
+            bash_command_with_tokens(0),
+            "exec bash -c '\"$(eval echo \\\"$0\\\")\"' \"${@:1}\""
+        );
+    }
+
+    // Ported from launcher-rust src/launch/shell.rs::shell_process_struct_constructible.
+    // launcher-rs ShellProcess has a divergent field shape (env: HashMap<String,String>
+    // not Vec<String>; profiles: Vec<String> not Vec<PathBuf>; working_directory not
+    // working_dir), so the literal is re-expressed against launcher-rs fields. Asserts
+    // the struct is constructible and round-trips script + env, matching the Go-faithful
+    // intent (script==true, env carries A=1).
+    #[test]
+    fn shell_process_struct_builds() {
+        let mut env = HashMap::new();
+        env.insert("A".to_string(), "1".to_string());
+        let p = ShellProcess {
+            script: true,
+            command: "echo hi".to_string(),
+            args: vec![],
+            env,
+            working_directory: "/app".to_string(),
+            profiles: vec!["/p".to_string()],
+            caller: "/cnb/lifecycle/launcher".to_string(),
+        };
+        assert!(p.script);
+        assert_eq!(p.env.get("A"), Some(&"1".to_string()));
+    }
+}
+
