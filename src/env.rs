@@ -1,43 +1,179 @@
-//! Environment variables management and CNB compliance.
+//! Primitives for assembling the launch-time environment per the Cloud Native Buildpacks specification.
 //!
-//! This module manages variables during launcher initialization and execution. It is responsible
-//! for purging forbidden variables from the host environment, sanitizing path-like lists (e.g., `PATH`
-//! and `LD_LIBRARY_PATH`), and loading layered configuration directories (`env`, `env.launch`, and
-//! `env.launch/<process>`) according to the Cloud Native Buildpacks specification rules.
+//! Provides building blocks for sanitizing the host environment, contributing a layer's implicit
+//! path entries, and applying the file-based modifications declared in layer env directories.
 
 use std::collections::HashMap;
+use std::env::{join_paths, split_paths};
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::iter;
 use std::path::{Path, PathBuf};
 
-/// Represents the environment modification action type defined by the CNB specification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionType {
-    /// Overwrites any existing value of the variable.
-    Override,
-    /// Sets the variable only if it does not already exist.
-    Default,
-    /// Appends the new value to the end of the variable, using an optional custom delimiter.
-    Append,
-    /// Prepends the new value to the beginning of the variable, using an optional custom delimiter.
-    Prepend,
+/// Builds the launch environment from a host environment, dropping CNB internal env vars and
+/// stripping the given paths from the `PATH` environment variable.
+pub(crate) fn sanitize_env_vars_for_launch<I>(
+    env_vars: I,
+    excluded_paths: &[PathBuf],
+) -> HashMap<OsString, OsString>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut filtered_env_vars = env_vars
+        .into_iter()
+        .filter(|(env_var_name, _)| {
+            LAUNCH_ENV_EXCLUDED_ENV_VARS
+                .iter()
+                .map(OsStr::new)
+                .all(|excluded_env_var_name| env_var_name != excluded_env_var_name)
+        })
+        .collect::<HashMap<_, _>>();
+
+    if let Some(path_value) = filtered_env_vars.get_mut(OsStr::new("PATH")) {
+        *path_value =
+            join_paths(split_paths(path_value).filter(|path| !excluded_paths.contains(path)))
+                .expect("split_paths output should never contain the platform path separator")
+    }
+
+    filtered_env_vars
 }
 
-impl std::str::FromStr for ActionType {
-    type Err = ();
+/// Contributes a single layer's paths to the launch-phase path variables
+/// listed in the CNB Buildpack spec under "Layer Paths" (`bin/` to `PATH`, `lib/` to `LD_LIBRARY_PATH`).
+/// Build-only mappings (`LIBRARY_PATH`, `CPATH`, `PKG_CONFIG_PATH`) are intentionally omitted.
+///
+/// Prepends to the path list. To get spec-compliant ordering (buildpack groups reversed,
+/// layers within a buildpack ascending alphabetically), call this with buildpacks in forward
+/// order and layers within each buildpack in reverse-alphabetical order.
+pub(crate) fn add_implicit_layer_dir_paths(
+    env: &mut HashMap<OsString, OsString>,
+    layer_dir: impl AsRef<Path>,
+) -> std::io::Result<()> {
+    let layer_dir = fs::canonicalize(layer_dir.as_ref())?;
 
-    fn from_str(suffix: &str) -> Result<Self, Self::Err> {
-        match suffix {
-            "override" => Ok(ActionType::Override),
-            "default" => Ok(ActionType::Default),
-            "append" => Ok(ActionType::Append),
-            "prepend" => Ok(ActionType::Prepend),
-            _ => Err(()),
+    for (dir_name, env_var_name) in IMPLICIT_LAYER_DIR_PATHS {
+        let dir = layer_dir.join(dir_name);
+
+        if !dir.is_dir() {
+            continue;
         }
+
+        env.entry(OsString::from(env_var_name))
+            .and_modify(|value| {
+                *value = join_paths(iter::once(dir.clone()).chain(split_paths(value)))
+                    .expect("split_paths output should never contain the platform path separator")
+            })
+            .or_insert_with(|| dir.into_os_string());
     }
+
+    Ok(())
+}
+
+/// Applies the file-based environment-variable modifications from a single env directory, per the
+/// CNB Buildpack spec's "Environment Variable Modification Rules".
+pub(crate) fn apply_env_dir_modifications(
+    env: &mut HashMap<OsString, OsString>,
+    env_dir: impl AsRef<Path>,
+) -> std::io::Result<()> {
+    let env_dir = env_dir.as_ref();
+
+    let mut filtered_dir_entries = fs::read_dir(env_dir)?
+        .filter_map(|dir_entry| {
+            dir_entry
+                .and_then(|dir_entry| {
+                    dir_entry
+                        .metadata()
+                        .map(|metadata| (!metadata.is_dir()).then_some(dir_entry))
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    filtered_dir_entries.sort_by_key(|dir_entry| dir_entry.file_name());
+
+    for dir_entry in filtered_dir_entries {
+        let file_name = dir_entry.file_name().to_string_lossy().to_string();
+        let (file_name_prefix, file_name_suffix) = file_name
+            .split_once('.')
+            .map(|(prefix, suffix)| (prefix, Some(suffix)))
+            .unwrap_or((&file_name, None));
+
+        let env_var = OsString::from(file_name_prefix);
+        let env_var_file_contents = read_env_file(&dir_entry.path())?;
+
+        match file_name_suffix {
+            None | Some("override") => {
+                env.insert(env_var, env_var_file_contents);
+            }
+            Some("default") => {
+                env.entry(env_var).or_insert(env_var_file_contents);
+            }
+            Some("append" | "prepend") => {
+                // Collapses the unset and empty cases to a single empty value. The CNB spec
+                // treats both the same by omitting the delimiter.
+                let existing_value = env.get(&env_var).cloned().unwrap_or_default();
+
+                let result = if existing_value.is_empty() {
+                    env_var_file_contents
+                } else {
+                    let delim_file_path = env_dir.join(format!("{file_name_prefix}.delim"));
+                    let delimiter = delim_file_path
+                        .is_file()
+                        .then_some(read_env_file(&delim_file_path))
+                        .transpose()?
+                        .unwrap_or_default();
+
+                    let mut result = OsString::new();
+                    match file_name_suffix {
+                        Some("append") => {
+                            result.push(existing_value);
+                            result.push(delimiter);
+                            result.push(env_var_file_contents);
+                        }
+                        Some("prepend") => {
+                            result.push(env_var_file_contents);
+                            result.push(delimiter);
+                            result.push(existing_value);
+                        }
+                        _ => unreachable!(
+                            "outer match guarantees file_name_suffix is Some(\"append\") or Some(\"prepend\"), got {file_name_suffix:?}"
+                        ),
+                    }
+                    result
+                };
+
+                env.insert(env_var, result);
+            }
+            // Delimiter files do nothing on their own and are skipped. See "append" and "prepend"
+            // suffixes.
+            Some("delim") => continue,
+            // Unknown suffixes are silently skipped.
+            Some(_) => continue,
+        };
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_env_file(path: &Path) -> std::io::Result<OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    fs::read(path).map(OsString::from_vec)
+}
+
+#[cfg(windows)]
+fn read_env_file(path: &Path) -> std::io::Result<OsString> {
+    // Windows env vars are UTF-16, and OsString on Windows stores WTF-8 (https://wtf-8.codeberg.page/),
+    // so any bytes we accept must be decodable as UTF-something. The CNB spec doesn't define an
+    // encoding for env files, but UTF-8 is the only sane assumption we can make here.
+    let bytes = fs::read(path)?;
+    String::from_utf8(bytes)
+        .map(OsString::from)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// The list of environment variables that are explicitly excluded from leaking into the final launch process environment.
-pub const LAUNCH_ENV_EXCLUDELIST: &[&str] = &[
+const LAUNCH_ENV_EXCLUDED_ENV_VARS: &[&str] = &[
     "CNB_LAYERS_DIR",
     "CNB_APP_DIR",
     "CNB_PROCESS_TYPE",
@@ -45,259 +181,12 @@ pub const LAUNCH_ENV_EXCLUDELIST: &[&str] = &[
     "CNB_DEPRECATION_MODE",
 ];
 
-/// Errors that can occur when processing the launch environment.
-#[derive(Debug, thiserror::Error)]
-pub enum LaunchEnvError {
-    /// Failed to canonicalize a layer directory path.
-    #[error("Canonicalize layer dir '{path}': {error}")]
-    Canonicalize {
-        /// The path that failed canonicalization.
-        path: String,
-        /// The underlying I/O error.
-        error: std::io::Error,
-    },
-    /// Failed to list the contents of an environment directory.
-    #[error("List env dir '{path}': {error}")]
-    ListDir {
-        /// The directory path that failed to list.
-        path: String,
-        /// The underlying I/O error.
-        error: std::io::Error,
-    },
-    /// Failed to read the contents of an environment variable file.
-    #[error("Read env file '{path}': {error}")]
-    ReadFile {
-        /// The file path that failed to read.
-        path: String,
-        /// The underlying I/O error.
-        error: std::io::Error,
-    },
-}
-
-/// Encapsulates the execution environment variables and layer-sourcing modifications for the launch process.
-pub struct LaunchEnv {
-    vars: HashMap<String, String>,
-    root_dir_map: HashMap<String, String>,
-}
-
-impl LaunchEnv {
-    /// Creates a new `LaunchEnv` populated from the host environment variables.
-    /// Excludes variables defined in `LAUNCH_ENV_EXCLUDELIST` and sanitizes the `PATH`
-    /// by stripping out the `process_dir` and `lifecycle_dir` to prevent runtime pollution.
-    pub fn new<I>(environ: I, process_dir: &str, lifecycle_dir: &str) -> Self
-    where
-        I: IntoIterator<Item = (String, String)>,
-    {
-        let mut vars = HashMap::new();
-
-        for (k, v) in environ {
-            if LAUNCH_ENV_EXCLUDELIST.contains(&k.as_str()) {
-                continue;
-            }
-            vars.insert(k, v);
-        }
-
-        // Sanitize PATH
-        if let Some(path_val) = vars.get("PATH").cloned() {
-            let parts = std::env::split_paths(&path_val);
-            let mut stripped = Vec::new();
-            let proc_path = Path::new(process_dir);
-            let lc_path = Path::new(lifecycle_dir);
-            for part in parts {
-                if part == proc_path || part == lc_path {
-                    continue;
-                }
-                stripped.push(part);
-            }
-            if let Ok(new_path) = std::env::join_paths(stripped) {
-                vars.insert("PATH".to_string(), new_path.to_string_lossy().into_owned());
-            }
-        }
-
-        let mut root_dir_map = HashMap::new();
-        root_dir_map.insert("bin".to_string(), "PATH".to_string());
-        root_dir_map.insert("lib".to_string(), "LD_LIBRARY_PATH".to_string());
-
-        LaunchEnv { vars, root_dir_map }
-    }
-
-    /// Sets an environment variable value directly.
-    pub fn set(&mut self, k: &str, v: &str) {
-        self.vars.insert(k.to_string(), v.to_string());
-    }
-
-    /// Gets an environment variable value.
-    pub fn get(&self, k: &str) -> Option<&String> {
-        self.vars.get(k)
-    }
-
-    /// Appends a root layer path to standard PATH and LD_LIBRARY_PATH variables.
-    pub fn add_root_dir<P: AsRef<Path>>(&mut self, layer_dir: P) -> Result<(), LaunchEnvError> {
-        let layer_dir = layer_dir.as_ref();
-        let abs_dir = fs::canonicalize(layer_dir).map_err(|e| LaunchEnvError::Canonicalize {
-            path: layer_dir.to_string_lossy().into_owned(),
-            error: e,
-        })?;
-
-        for (sub_dir, var_name) in &self.root_dir_map {
-            let child_dir = abs_dir.join(sub_dir);
-            if child_dir.is_dir() {
-                let child_str = child_dir.to_string_lossy().into_owned();
-                let current = self.vars.get(var_name).cloned().unwrap_or_default();
-                if current.is_empty() {
-                    self.vars.insert(var_name.clone(), child_str.clone());
-                } else {
-                    // Prepend layer path using standard PATH separator
-                    let mut paths = vec![PathBuf::from(&child_str)];
-                    paths.extend(std::env::split_paths(&current));
-                    if let Ok(new_path) = std::env::join_paths(paths) {
-                        self.vars
-                            .insert(var_name.clone(), new_path.to_string_lossy().into_owned());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Processes a directory containing environment files and applies them sequentially.
-    pub fn add_env_dir<P: AsRef<Path>>(
-        &mut self,
-        env_dir: P,
-        default_action: ActionType,
-    ) -> Result<(), LaunchEnvError> {
-        let env_dir = env_dir.as_ref();
-        if !env_dir.is_dir() {
-            return Ok(());
-        }
-
-        let entries = fs::read_dir(env_dir).map_err(|e| LaunchEnvError::ListDir {
-            path: env_dir.to_string_lossy().into_owned(),
-            error: e,
-        })?;
-
-        let mut files: Vec<(std::ffi::OsString, std::fs::DirEntry)> = entries
-            .filter_map(|entry_res| {
-                let entry = match entry_res {
-                    Ok(e) => e,
-                    Err(err) => {
-                        return Some(Err(LaunchEnvError::ListDir {
-                            path: env_dir.to_string_lossy().into_owned(),
-                            error: err,
-                        }));
-                    }
-                };
-                match fs::metadata(entry.path()) {
-                    Ok(meta) if meta.is_dir() => None,
-                    Ok(_) => Some(Ok((entry.file_name(), entry))),
-                    Err(_) => None,
-                }
-            })
-            .collect::<Result<Vec<_>, LaunchEnvError>>()?;
-
-        files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-        for (file_name_os, file) in files {
-            let file_name = file_name_os.to_string_lossy().into_owned();
-            let Some((name, action)) = parse_env_file_parts(&file_name, default_action) else {
-                continue;
-            };
-            let file_path = file.path();
-
-            let v = fs::read_to_string(&file_path).map_err(|e| LaunchEnvError::ReadFile {
-                path: file_path.to_string_lossy().into_owned(),
-                error: e,
-            })?;
-
-            // Read custom delimiter if present
-            let delim_path = env_dir.join(format!("{}.delim", name));
-            let delim = if delim_path.is_file() {
-                fs::read_to_string(&delim_path).ok()
-            } else {
-                None
-            };
-
-            if let Some(new_val) = self.evaluate_env_modifier(&name, action, v, delim.as_deref()) {
-                self.vars.insert(name, new_val);
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns a reference to the internal environment variable map.
-    pub fn vars(&self) -> &HashMap<String, String> {
-        &self.vars
-    }
-
-    /// Evaluates how to modify the environment variable value based on the specified [`ActionType`].
-    ///
-    /// Returns `Some(String)` with the new value if the action is successful, or `None` if the action
-    /// specifies a modification that should be skipped (e.g., `Default` on a non-empty variable).
-    fn evaluate_env_modifier(
-        &self,
-        name: &str,
-        action: ActionType,
-        v: String,
-        delim: Option<&str>,
-    ) -> Option<String> {
-        match action {
-            ActionType::Override => Some(v),
-            ActionType::Default => {
-                if self.vars.get(name).map(|s| s.is_empty()).unwrap_or(true) {
-                    Some(v)
-                } else {
-                    None
-                }
-            }
-            ActionType::Append => {
-                let d = delim.unwrap_or("");
-                match self.vars.get(name) {
-                    Some(current) if !current.is_empty() => Some(format!("{}{}{}", current, d, v)),
-                    _ => Some(v),
-                }
-            }
-            ActionType::Prepend => {
-                let d = delim.unwrap_or("");
-                match self.vars.get(name) {
-                    Some(current) if !current.is_empty() => Some(format!("{}{}{}", v, d, current)),
-                    _ => Some(v),
-                }
-            }
-        }
-    }
-}
-
-/// Parses a filename from an environment directory into the target environment variable name
-/// and the corresponding [`ActionType`] modifier suffix.
-///
-/// File names can optionally end with a dot followed by the action type (e.g. `.override`, `.default`,
-/// `.append`, `.prepend`). If no suffix is present, the specified `default_action` is returned.
-/// Files ending with `.delim` are ignored.
-fn parse_env_file_parts(
-    file_name: &str,
-    default_action: ActionType,
-) -> Option<(String, ActionType)> {
-    let (name, suffix) = match file_name.split_once('.') {
-        Some((n, s)) => (n, s),
-        None => (file_name, ""),
-    };
-
-    // Delimiter files are ignored in the main action loop
-    if suffix == "delim" {
-        return None;
-    }
-
-    let action = match suffix {
-        "" => default_action,
-        other => other.parse().ok()?,
-    };
-
-    Some((name.to_string(), action))
-}
+const IMPLICIT_LAYER_DIR_PATHS: &[(&str, &str)] = &[("bin", "PATH"), ("lib", "LD_LIBRARY_PATH")];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use tempfile::tempdir;
 
     #[test]
@@ -307,16 +196,24 @@ mod tests {
         } else {
             "/lifecycle:/process:/usr/bin"
         };
-        let host_env = vec![
-            ("PATH".to_string(), path_val.to_string()),
-            ("CNB_APP_DIR".to_string(), "/workspace".to_string()),
-            ("FOO".to_string(), "bar".to_string()),
-        ];
-        let env = LaunchEnv::new(host_env, "/process", "/lifecycle");
 
-        assert!(env.get("CNB_APP_DIR").is_none());
-        assert_eq!(env.get("FOO").unwrap(), "bar");
-        assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
+        let host_env = vec![
+            (OsString::from("PATH"), OsString::from(path_val)),
+            (OsString::from("CNB_APP_DIR"), OsString::from("/workspace")),
+            (OsString::from("FOO"), OsString::from("bar")),
+        ];
+
+        let env = sanitize_env_vars_for_launch(
+            host_env,
+            &[PathBuf::from("/process"), PathBuf::from("/lifecycle")],
+        );
+
+        assert_eq!(env.get(OsStr::new("CNB_APP_DIR")), None);
+        assert_eq!(env.get(OsStr::new("FOO")), Some(&OsString::from("bar")));
+        assert_eq!(
+            env.get(OsStr::new("PATH")),
+            Some(&OsString::from("/usr/bin"))
+        );
     }
 
     #[test]
@@ -328,14 +225,15 @@ mod tests {
         fs::write(dir_path.join("FOO"), "unsuffixed_val").unwrap();
         fs::write(dir_path.join("BAR.override"), "override_val").unwrap();
 
-        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
-        env.set("FOO", "original_foo");
-        env.set("BAR", "original_bar");
+        let mut env =
+            sanitize_env_vars_for_launch(iter::empty(), &["/process".into(), "/lifecycle".into()]);
+        env.insert(OsString::from("FOO"), OsString::from("original_foo"));
+        env.insert(OsString::from("BAR"), OsString::from("original_bar"));
 
-        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        apply_env_dir_modifications(&mut env, dir_path).unwrap();
 
-        assert_eq!(env.get("FOO").unwrap(), "unsuffixed_val");
-        assert_eq!(env.get("BAR").unwrap(), "override_val");
+        assert_eq!(env.get(OsStr::new("FOO")).unwrap(), "unsuffixed_val");
+        assert_eq!(env.get(OsStr::new("BAR")).unwrap(), "override_val");
 
         // 2. Default suffix
         let dir2 = tempdir().unwrap();
@@ -343,12 +241,12 @@ mod tests {
         fs::write(dir2_path.join("FOO.default"), "default_val").unwrap();
         fs::write(dir2_path.join("BAZ.default"), "default_val").unwrap();
 
-        env.add_env_dir(dir2_path, ActionType::Override).unwrap();
+        apply_env_dir_modifications(&mut env, dir2_path).unwrap();
 
         // FOO already exists, so default does not override it
-        assert_eq!(env.get("FOO").unwrap(), "unsuffixed_val");
+        assert_eq!(env.get(OsStr::new("FOO")).unwrap(), "unsuffixed_val");
         // BAZ does not exist, so it gets set
-        assert_eq!(env.get("BAZ").unwrap(), "default_val");
+        assert_eq!(env.get(OsStr::new("BAZ")).unwrap(), "default_val");
     }
 
     #[test]
@@ -360,142 +258,163 @@ mod tests {
         fs::write(dir_path.join("VAR.append"), "appendage").unwrap();
         fs::write(dir_path.join("VAR.delim"), "-").unwrap();
 
-        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
-        env.set("PATH", "/usr/bin");
-        env.set("VAR", "base");
+        let mut env = sanitize_env_vars_for_launch(iter::empty(), &[]);
+        env.insert(OsString::from("PATH"), OsString::from("/usr/bin"));
+        env.insert(OsString::from("VAR"), OsString::from("base"));
 
-        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        apply_env_dir_modifications(&mut env, dir_path).unwrap();
 
         // PATH prepends without separator unless .delim specifies one
         let expected_path = "/layer/bin/usr/bin";
-        assert_eq!(env.get("PATH").unwrap(), expected_path);
+        assert_eq!(env.get(OsStr::new("PATH")).unwrap(), expected_path);
         // VAR uses custom delimiter "-"
-        assert_eq!(env.get("VAR").unwrap(), "base-appendage");
+        assert_eq!(env.get(OsStr::new("VAR")).unwrap(), "base-appendage");
     }
 
     #[test]
-    fn test_parse_env_file_parts() {
-        use super::{ActionType, parse_env_file_parts};
+    fn test_apply_env_dir_override_sets_absent_var() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("FOO.override"), "value").unwrap();
 
-        // Valid suffixes
-        assert_eq!(
-            parse_env_file_parts("MY_VAR.override", ActionType::Default),
-            Some(("MY_VAR".to_string(), ActionType::Override))
-        );
-        assert_eq!(
-            parse_env_file_parts("MY_VAR.default", ActionType::Override),
-            Some(("MY_VAR".to_string(), ActionType::Default))
-        );
-        assert_eq!(
-            parse_env_file_parts("MY_VAR.append", ActionType::Override),
-            Some(("MY_VAR".to_string(), ActionType::Append))
-        );
-        assert_eq!(
-            parse_env_file_parts("MY_VAR.prepend", ActionType::Override),
-            Some(("MY_VAR".to_string(), ActionType::Prepend))
-        );
+        let mut env = HashMap::new();
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
 
-        // Unsuffixed file uses the default action
-        assert_eq!(
-            parse_env_file_parts("MY_VAR", ActionType::Default),
-            Some(("MY_VAR".to_string(), ActionType::Default))
-        );
+        assert_eq!(env.get(OsStr::new("FOO")).unwrap(), "value");
+    }
 
-        // Multiple periods (spec compliance: split on the first period)
-        // Suffix is "name.override" (unknown) -> ignored (returns None)
-        assert_eq!(
-            parse_env_file_parts("MY_VAR.name.override", ActionType::Default),
-            None
-        );
+    #[test]
+    fn test_apply_env_dir_append_without_delim_uses_empty_separator() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("VAR.append"), "appended-value").unwrap();
 
-        // Delimiter files -> ignored (returns None)
-        assert_eq!(
-            parse_env_file_parts("MY_VAR.delim", ActionType::Default),
-            None
-        );
+        let mut env = HashMap::new();
+        env.insert(OsString::from("VAR"), OsString::from("base-value"));
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
 
-        // Unknown suffix -> ignored (returns None)
         assert_eq!(
-            parse_env_file_parts("MY_VAR.invalid_suffix", ActionType::Default),
-            None
+            env.get(OsStr::new("VAR")).unwrap(),
+            "base-valueappended-value"
         );
     }
 
     #[test]
-    fn test_evaluate_env_modifier() {
-        use super::{ActionType, LaunchEnv};
+    fn test_apply_env_dir_append_on_absent_var_omits_delimiter() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("VAR.append"), "value").unwrap();
+        fs::write(dir.path().join("VAR.delim"), ":").unwrap();
 
-        let env = LaunchEnv::new(std::iter::empty(), "", "");
+        let mut env = HashMap::new();
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
 
-        // 1. Override
+        assert_eq!(env.get(OsStr::new("VAR")).unwrap(), "value");
+    }
+
+    #[test]
+    fn test_apply_env_dir_prepend_on_absent_var_omits_delimiter() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("VAR.prepend"), "value").unwrap();
+        fs::write(dir.path().join("VAR.delim"), ":").unwrap();
+
+        let mut env = HashMap::new();
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
+
+        assert_eq!(env.get(OsStr::new("VAR")).unwrap(), "value");
+    }
+
+    #[test]
+    fn test_apply_env_dir_unknown_suffix_is_ignored() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("FOO.invalid_suffix"), "value").unwrap();
+
+        let mut env = HashMap::new();
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
+
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_apply_env_dir_splits_on_first_dot() {
+        // Per CNB spec, the variable name is everything up to the first period.
+        // `MY.VAR.override` -> name=`MY`, suffix=`VAR.override` (unknown) -> ignored.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("MY.VAR.override"), "value").unwrap();
+
+        let mut env = HashMap::new();
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
+
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_apply_env_dir_lone_delim_is_a_noop() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("VAR.delim"), ":").unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(OsString::from("VAR"), OsString::from("original"));
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
+
+        assert_eq!(env.get(OsStr::new("VAR")).unwrap(), "original");
+    }
+
+    #[test]
+    fn test_apply_env_dir_append_on_empty_var_omits_delimiter() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("VAR.append"), "value").unwrap();
+        fs::write(dir.path().join("VAR.delim"), ":").unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(OsString::from("VAR"), OsString::new());
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
+
+        assert_eq!(env.get(OsStr::new("VAR")).unwrap(), "value");
+    }
+
+    #[test]
+    fn test_apply_env_dir_append_and_prepend_in_same_dir() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("VAR.append"), "appended-value").unwrap();
+        fs::write(dir.path().join("VAR.prepend"), "prepended-value").unwrap();
+        fs::write(dir.path().join("VAR.delim"), ":").unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(OsString::from("VAR"), OsString::from("base-value"));
+        apply_env_dir_modifications(&mut env, dir.path()).unwrap();
+
         assert_eq!(
-            env.evaluate_env_modifier("FOO", ActionType::Override, "val1".to_string(), None),
-            Some("val1".to_string())
+            env.get(OsStr::new("VAR")).unwrap(),
+            "prepended-value:base-value:appended-value"
         );
+    }
 
-        // 2. Default
-        // When empty -> Some
-        assert_eq!(
-            env.evaluate_env_modifier("BAR", ActionType::Default, "val1".to_string(), None),
-            Some("val1".to_string())
-        );
+    #[test]
+    #[cfg(unix)]
+    fn test_apply_env_dir_broken_symlink_aborts() {
+        use std::os::unix::fs::symlink;
 
-        // When not empty -> None
-        let mut env_with_val = LaunchEnv::new(std::iter::empty(), "", "");
-        env_with_val.set("BAR", "val1");
-        assert_eq!(
-            env_with_val.evaluate_env_modifier(
-                "BAR",
-                ActionType::Default,
-                "val2".to_string(),
-                None
-            ),
-            None
-        );
+        let dir = tempdir().unwrap();
+        symlink("/nonexistent/target", dir.path().join("FOO")).unwrap();
 
-        // 3. Append (default no delimiter)
-        assert_eq!(
-            env_with_val.evaluate_env_modifier("BAR", ActionType::Append, "val2".to_string(), None),
-            Some("val1val2".to_string())
-        );
+        let mut env = HashMap::new();
+        let result = apply_env_dir_modifications(&mut env, dir.path());
 
-        // 4. Append with custom delimiter
-        assert_eq!(
-            env_with_val.evaluate_env_modifier(
-                "BAR",
-                ActionType::Append,
-                "val3".to_string(),
-                Some("-")
-            ),
-            Some("val1-val3".to_string())
-        );
-
-        // 5. Prepend path variable (uses no separator without .delim)
-        let mut env_with_path = LaunchEnv::new(std::iter::empty(), "", "");
-        env_with_path.set("PATH", "/usr/bin");
-        let expected = "/bin/usr/bin";
-        assert_eq!(
-            env_with_path.evaluate_env_modifier(
-                "PATH",
-                ActionType::Prepend,
-                "/bin".to_string(),
-                None
-            ),
-            Some(expected.to_string())
-        );
+        assert!(result.is_err());
     }
 
     #[test]
     #[cfg(windows)]
     fn test_new_launch_env_purging_mixed_slashes_windows() {
         let host_env = vec![(
-            "PATH".to_string(),
-            r"\lifecycle;C:\process;C:\usr\bin".to_string(),
+            OsString::from("PATH"),
+            OsString::from(r"\lifecycle;C:\process;C:\usr\bin"),
         )];
         // Mixed slash input: forward slash in process_dir and lifecycle_dir
-        let env = LaunchEnv::new(host_env, "C:/process", "/lifecycle");
+        let env = sanitize_env_vars_for_launch(
+            host_env,
+            &[PathBuf::from("C:/process"), PathBuf::from("/lifecycle")],
+        );
 
-        assert_eq!(env.get("PATH").unwrap(), r"C:\usr\bin");
+        assert_eq!(env.get(OsStr::new("PATH")).unwrap(), r"C:\usr\bin");
     }
 
     #[test]
@@ -505,9 +424,10 @@ mod tests {
         } else {
             "/lifecycle/:/process/:/usr/bin"
         };
-        let host_env = vec![("PATH".to_string(), path_val.to_string())];
-        let env = LaunchEnv::new(host_env, "/process", "/lifecycle");
 
-        assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
+        let host_env = vec![(OsString::from("PATH"), OsString::from(path_val))];
+        let env = sanitize_env_vars_for_launch(host_env, &["/process".into(), "/lifecycle".into()]);
+
+        assert_eq!(env.get(OsStr::new("PATH")).unwrap(), "/usr/bin");
     }
 }

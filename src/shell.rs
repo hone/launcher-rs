@@ -5,6 +5,7 @@
 //! and sourcing any buildpack-contributed profile scripts before starting the process.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -23,7 +24,7 @@ pub struct ShellProcess {
     /// List of profile shell scripts (`profile.d/*.sh`, `.profile`) to source before launch.
     pub profiles: Vec<String>,
     /// The target environment variable map.
-    pub env: HashMap<String, String>,
+    pub env: HashMap<OsString, OsString>,
     /// Custom working directory.
     pub working_directory: String,
 }

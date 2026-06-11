@@ -8,8 +8,8 @@
 //! Under Windows, the communication is established using an inherited Win32 pipe handle specified by
 //! the `CNB_EXEC_D_HANDLE` environment variable.
 
-use crate::env::LaunchEnv;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -77,7 +77,7 @@ pub enum ExecDError {
 #[cfg(unix)]
 pub fn run_exec_d<P: AsRef<Path>>(
     path: P,
-    env: &LaunchEnv,
+    env: &HashMap<OsString, OsString>,
 ) -> Result<HashMap<String, String>, ExecDError> {
     let path = path.as_ref();
     let (reader_fd, writer_fd) = rustix::pipe::pipe()
@@ -89,7 +89,7 @@ pub fn run_exec_d<P: AsRef<Path>>(
     let writer_fd = writer.as_raw_fd();
 
     let mut cmd = Command::new(path);
-    cmd.envs(env.vars());
+    cmd.envs(env);
 
     unsafe {
         cmd.pre_exec(move || {
@@ -179,7 +179,7 @@ mod win32 {
 #[cfg(windows)]
 pub fn run_exec_d<P: AsRef<Path>>(
     path: P,
-    env: &LaunchEnv,
+    env: &HashMap<OsString, OsString>,
 ) -> Result<HashMap<String, String>, ExecDError> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::process::Stdio;
@@ -221,8 +221,11 @@ pub fn run_exec_d<P: AsRef<Path>>(
     cmd.stderr(Stdio::inherit());
 
     // Inject CNB_EXEC_D_HANDLE variable
-    let mut child_env = env.vars().clone();
-    child_env.insert("CNB_EXEC_D_HANDLE".to_string(), handle_hex);
+    let mut child_env = env.clone();
+    child_env.insert(
+        OsString::from("CNB_EXEC_D_HANDLE"),
+        OsString::from(handle_hex),
+    );
     cmd.envs(&child_env);
 
     let mut child = cmd.spawn().map_err(|e| ExecDError::Spawn {
@@ -290,8 +293,7 @@ echo 'MY_NEW_VAR = "injected_value"' >&3
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).unwrap();
 
-        let env = LaunchEnv::new(std::iter::empty(), "", "");
-        let res = run_exec_d(&script_path, &env);
+        let res = run_exec_d(&script_path, &HashMap::new());
 
         assert!(res.is_ok(), "Failed to run exec.d: {:?}", res.err());
         let vars = res.unwrap();
