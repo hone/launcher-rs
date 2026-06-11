@@ -511,3 +511,351 @@ mod tests {
         assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
     }
 }
+
+#[cfg(test)]
+mod ported_rust_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    // ----- pass: override replaces value, ignores any .delim sidecar -----
+    #[test]
+    fn override_replaces_value_and_ignores_delim() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        fs::write(dir_path.join("FOO.override"), "new").unwrap();
+        fs::write(dir_path.join("FOO.delim"), "::").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("FOO", "old");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("new"));
+    }
+
+    // ----- pass: default only writes when current is empty/unset -----
+    #[test]
+    fn default_only_writes_when_empty() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        fs::write(dir_path.join("FOO.default"), "fallback").unwrap();
+        fs::write(dir_path.join("BAR.default"), "set-bar").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("FOO", "preset");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("preset"));
+        assert_eq!(env.get("BAR").map(String::as_str), Some("set-bar"));
+    }
+
+    // ----- pass: append uses explicit .delim when present -----
+    #[test]
+    fn append_uses_delim_when_present() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        fs::write(dir_path.join("PATH.append"), "/tail").unwrap();
+        fs::write(dir_path.join("PATH.delim"), ":").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("PATH", "/head");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/head:/tail"));
+    }
+
+    // ----- pass: append with no .delim concatenates raw (empty default delim) -----
+    #[test]
+    fn append_without_delim_concatenates_raw() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        fs::write(dir_path.join("FOO.append"), "Y").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("FOO", "X");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("XY"));
+    }
+
+    // ----- pass: prepend with no .delim concatenates raw (empty default delim) -----
+    #[test]
+    fn prepend_without_delim_concatenates_raw() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        fs::write(dir_path.join("FOO.prepend"), "X").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("FOO", "Y");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("XY"));
+    }
+
+    // ----- pass: prepend uses explicit .delim when present -----
+    #[test]
+    fn prepend_uses_delim_when_present() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        fs::write(dir_path.join("PATH.prepend"), "/new").unwrap();
+        fs::write(dir_path.join("PATH.delim"), ":").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("PATH", "/old");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/new:/old"));
+    }
+
+    // ----- pass: a file with an unrecognized suffix is silently skipped -----
+    #[test]
+    fn unknown_suffix_is_silently_skipped() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        fs::write(dir_path.join("FOO.weirdsuffix"), "v").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("FOO", "keep");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("keep"));
+    }
+
+    // ----- pass: a `.delim` sidecar file is not itself treated as a variable -----
+    #[test]
+    fn delim_sidecar_not_treated_as_var() {
+        // parse_env_file_parts ignores `.delim` files entirely.
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.delim", ActionType::Override),
+            None
+        );
+        // And applying a dir that only holds a `.delim` file changes nothing.
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        fs::write(dir_path.join("FOO.delim"), ":").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("FOO"), None);
+    }
+
+    // ----- pass: filename is split on the FIRST '.'; multi-dot suffix is unknown -> None -----
+    #[test]
+    fn split_on_first_dot_suffix() {
+        // "MY_VAR.name.override" splits to name="MY_VAR", suffix="name.override" (unknown) -> None.
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.name.override", ActionType::Default),
+            None
+        );
+        // Single recognized suffix parses normally.
+        assert_eq!(
+            parse_env_file_parts("MY_VAR.override", ActionType::Default),
+            Some(("MY_VAR".to_string(), ActionType::Override))
+        );
+    }
+
+    // ----- pass: excludelist keys are dropped from the launch env -----
+    #[test]
+    fn vars_excludelist_drops_keys() {
+        let pairs = vec![
+            ("KEEP".to_string(), "1".to_string()),
+            ("CNB_APP_DIR".to_string(), "/x".to_string()),
+            ("CNB_PLATFORM_API".to_string(), "0.10".to_string()),
+        ];
+        let env = LaunchEnv::new(pairs, "", "");
+        assert_eq!(env.get("KEEP").map(String::as_str), Some("1"));
+        assert_eq!(env.get("CNB_APP_DIR"), None);
+        assert_eq!(env.get("CNB_PLATFORM_API"), None);
+    }
+
+    // ----- pass: basic (key,value) pairs survive construction; '=' in value preserved -----
+    #[test]
+    fn vars_from_pairs_basic() {
+        let pairs = vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("BAZ".to_string(), "qux=etc".to_string()),
+        ];
+        let env = LaunchEnv::new(pairs, "", "");
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(env.get("BAZ").map(String::as_str), Some("qux=etc"));
+    }
+
+    // ----- pass: process_dir/lifecycle_dir are stripped from PATH at construction -----
+    #[test]
+    fn new_launch_env_seeds_path_dirs() {
+        let path_val = if cfg!(windows) {
+            "/lifecycle;/process;/usr/bin"
+        } else {
+            "/lifecycle:/process:/usr/bin"
+        };
+        let pairs = vec![("PATH".to_string(), path_val.to_string())];
+        let env = LaunchEnv::new(pairs, "/process", "/lifecycle");
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+
+    // ----- pass: subdirectories within an env dir are skipped, not applied -----
+    #[test]
+    fn add_env_dir_skips_subdirectories() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        // A directory named like an override file must be ignored.
+        fs::create_dir_all(dir_path.join("FOO.override")).unwrap();
+        // A regular file alongside it is still applied.
+        fs::write(dir_path.join("BAR.override"), "bar-val").unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("FOO", "original");
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("original"));
+        assert_eq!(env.get("BAR").map(String::as_str), Some("bar-val"));
+    }
+
+    // ----- pass: the launch default action is Override (unsuffixed file uses it) -----
+    #[test]
+    fn default_action_is_override() {
+        // No `default_action_type()` fn exists in launcher-rs; pin the same
+        // Go-correct Override default via the unsuffixed-uses-default seam.
+        assert_eq!(
+            parse_env_file_parts("FOO", ActionType::Override),
+            Some(("FOO".to_string(), ActionType::Override))
+        );
+    }
+
+    // ----- pass: prepend followed by prepend accumulates left-to-right -----
+    #[test]
+    fn prepend_then_prepend_accumulates() {
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("PATH", "/base");
+
+        let dir1 = tempdir().unwrap();
+        fs::write(dir1.path().join("PATH.prepend"), "/first").unwrap();
+        fs::write(dir1.path().join("PATH.delim"), ":").unwrap();
+        env.add_env_dir(dir1.path(), ActionType::Override).unwrap();
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/first:/base"));
+
+        let dir2 = tempdir().unwrap();
+        fs::write(dir2.path().join("PATH.prepend"), "/second").unwrap();
+        fs::write(dir2.path().join("PATH.delim"), ":").unwrap();
+        env.add_env_dir(dir2.path(), ActionType::Override).unwrap();
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/second:/first:/base")
+        );
+    }
+
+    // ----- pass: override then a later default does NOT clobber the override -----
+    #[test]
+    fn override_then_default_keeps_override() {
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+
+        let dir1 = tempdir().unwrap();
+        fs::write(dir1.path().join("FOO.override"), "overridden").unwrap();
+        env.add_env_dir(dir1.path(), ActionType::Override).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("overridden"));
+
+        let dir2 = tempdir().unwrap();
+        fs::write(dir2.path().join("FOO.default"), "fallback").unwrap();
+        env.add_env_dir(dir2.path(), ActionType::Override).unwrap();
+        // Default skips because FOO is already non-empty.
+        assert_eq!(env.get("FOO").map(String::as_str), Some("overridden"));
+    }
+
+    // ----- pass: an empty env dir is a no-op -----
+    #[test]
+    fn empty_env_dir_is_noop() {
+        let dir = tempdir().unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.add_env_dir(dir.path(), ActionType::Override).unwrap();
+        assert!(env.vars().is_empty());
+    }
+
+    // GAP: launcher-rs strips trailing-slash PATH entries ('/proc/' purged) via
+    // split_paths/join_paths normalization, but Go strips by EXACT string match so
+    // '/proc/' (!= '/proc') is KEPT. Asserting the Go-correct kept value FAILS
+    // against launcher-rs (cf. its own test_new_launch_env_purging_trailing_slashes).
+    #[test]
+    fn strip_path_removes_exact_matches() {
+        let pairs = vec![("PATH".to_string(), "/a:/proc/:/b".to_string())];
+        let env = LaunchEnv::new(pairs, "/proc", "/life");
+        // Go-correct: trailing-slash entry is not an exact match -> retained.
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/a:/proc/:/b"));
+    }
+
+    // GAP: launcher-rs add_root_dir calls fs::canonicalize(layer_dir) first, which
+    // on macOS rewrites the layer path (e.g. /var -> /private/var symlink resolution),
+    // whereas Go uses filepath.Abs (no symlink resolution). Asserting the Go-correct
+    // un-canonicalized layer/bin path FAILS against launcher-rs's canonicalized output.
+    #[test]
+    fn add_root_dir_prepends_existing_subdirs() {
+        let layer = tempdir().unwrap();
+        let layer_path = layer.path();
+        fs::create_dir_all(layer_path.join("bin")).unwrap();
+        fs::create_dir_all(layer_path.join("lib")).unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("PATH", "/usr/bin");
+        env.add_root_dir(layer_path).unwrap();
+        // Go-correct: raw (Abs, non-canonicalized) layer/bin prefix.
+        let bin = layer_path.join("bin").to_string_lossy().into_owned();
+        let lib = layer_path.join("lib").to_string_lossy().into_owned();
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(format!("{}:/usr/bin", bin).as_str())
+        );
+        assert_eq!(env.get("LD_LIBRARY_PATH").map(String::as_str), Some(lib.as_str()));
+    }
+
+    // GAP: Go AddRootDir sets the missing subdir's var to the empty string ("");
+    // launcher-rs never inserts the key when the child dir is absent, so get()
+    // returns None. Asserting the Go-correct Some("") FAILS (it is None).
+    #[test]
+    fn add_root_dir_skips_missing_subdirs() {
+        let layer = tempdir().unwrap();
+        let layer_path = layer.path();
+        fs::create_dir_all(layer_path.join("bin")).unwrap();
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.add_root_dir(layer_path).unwrap();
+        assert_eq!(env.get("PATH").map(|s| !s.is_empty()), Some(true));
+        // Go-correct: missing lib -> LD_LIBRARY_PATH is set to "".
+        assert_eq!(env.get("LD_LIBRARY_PATH").map(String::as_str), Some(""));
+    }
+
+    // GAP: Go AddRootDir uses filepath.Abs (a pure path op, never stats) so a missing
+    // layer dir is not an error -- subdir Stat just misses and is skipped, returning nil.
+    // launcher-rs canonicalizes first (fs::canonicalize), which errors on a missing dir.
+    // Asserting the Go-correct Ok FAILS (launcher-rs returns Err).
+    #[test]
+    fn add_root_dir_missing_layer_errors_not_noop() {
+        let base = tempdir().unwrap();
+        let missing = base.path().join("no-such-layer");
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        let r = env.add_root_dir(&missing);
+        // Go-correct: missing layer is a no-op, not an error.
+        assert!(r.is_ok());
+    }
+
+    // GAP: same canonicalize-vs-Abs divergence as add_root_dir_prepends_existing_subdirs.
+    // The composed PATH assertion uses the Go-correct un-canonicalized layer/bin prefix,
+    // which FAILS against launcher-rs's canonicalized add_root_dir output. (The FOO=bar
+    // and vars() membership assertions are Go-correct and pass.)
+    #[test]
+    fn env_wrapper_round_trip() {
+        let layer = tempdir().unwrap();
+        let layer_path = layer.path();
+        fs::create_dir_all(layer_path.join("bin")).unwrap();
+        let env_dir = layer_path.join("env");
+        fs::create_dir_all(&env_dir).unwrap();
+        fs::write(env_dir.join("FOO.override"), "bar").unwrap();
+
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("PATH", "/usr/bin");
+        env.add_root_dir(layer_path).unwrap();
+        env.add_env_dir(&env_dir, ActionType::Override).unwrap();
+
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        let bin = layer_path.join("bin").to_string_lossy().into_owned();
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(format!("{}:/usr/bin", bin).as_str())
+        );
+        assert!(env.vars().iter().any(|(k, v)| k == "FOO" && v == "bar"));
+    }
+
+    // GAP: Go's empty-suffix PrependPath action uses os.PathListSeparator (':') as the
+    // default delim for PATH-like vars: '/bin' prepended to '/usr/bin' -> '/bin:/usr/bin'.
+    // launcher-rs has NO PrependPath action; generic Prepend defaults the delim to "" so it
+    // returns '/bin/usr/bin' (raw concat). Asserting the Go-correct ':' value FAILS
+    // (cf. launcher-rs's own test_evaluate_env_modifier which asserts '/bin/usr/bin').
+    #[test]
+    fn evaluate_env_modifier_prepend_path_no_delim_raw_concat() {
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
+        env.set("PATH", "/usr/bin");
+        let got =
+            env.evaluate_env_modifier("PATH", ActionType::Prepend, "/bin".to_string(), None);
+        // Go PrependPath-correct: ':' default separator for PATH.
+        assert_eq!(got, Some("/bin:/usr/bin".to_string()));
+    }
+}

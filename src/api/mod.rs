@@ -177,3 +177,76 @@ mod tests {
         assert!(v0_10.at_least("0.4"));
     }
 }
+
+#[cfg(test)]
+mod ported_rust_tests {
+    use super::*;
+
+    // Mirrors launcher-rust src/api.rs:255-265 parse_two_part.
+    // Go-correct: Version{major:0, minor:10}.
+    #[test]
+    fn version_parse_two_part() {
+        let v = Version::from_str("0.10").unwrap();
+        assert_eq!(v, Version { major: 0, minor: 10 });
+    }
+
+    // Mirrors launcher-rust src/api.rs:267-271 parse_with_v_prefix.
+    // 'v' prefix stripped -> Version{major:1, minor:2}.
+    #[test]
+    fn version_parse_with_v_prefix() {
+        let v = Version::from_str("v1.2").unwrap();
+        assert_eq!(v, Version { major: 1, minor: 2 });
+    }
+
+    // Mirrors launcher-rust src/api.rs:273-277 parse_major_only.
+    // Missing minor defaults to 0 -> Version{major:1, minor:0}.
+    #[test]
+    fn version_parse_major_only() {
+        let v = Version::from_str("1").unwrap();
+        assert_eq!(v, Version { major: 1, minor: 0 });
+    }
+
+    // Mirrors launcher-rust src/api.rs:137-147 test_version_display (Display impl).
+    // Go-correct: "{major}.{minor}".
+    #[test]
+    fn version_display_major_minor() {
+        assert_eq!(Version { major: 0, minor: 15 }.to_string(), "0.15");
+        assert_eq!(Version { major: 1, minor: 0 }.to_string(), "1.0");
+    }
+
+    // Mirrors launcher-rust src/api.rs:287-294 at_least_basic.
+    // launcher-rust numeric args (0,10)/(0,9)/(0,11)/(1,0) re-expressed as &str
+    // because launcher-rs at_least takes &str.
+    #[test]
+    fn version_at_least_basic() {
+        let v = Version { major: 0, minor: 10 };
+        assert!(v.at_least("0.10"));
+        assert!(v.at_least("0.9"));
+        assert!(!v.at_least("0.11"));
+        assert!(!v.at_least("1.0"));
+    }
+
+    // Mirrors launcher-rust src/api.rs:296-302 less_than_basic.
+    // launcher-rust numeric args (0,10)/(0,9)/(1,0) re-expressed as &str
+    // because launcher-rs less_than takes &str.
+    #[test]
+    fn version_less_than_basic() {
+        let v = Version { major: 0, minor: 9 };
+        assert!(v.less_than("0.10"));
+        assert!(!v.less_than("0.9"));
+        assert!(v.less_than("1.0"));
+    }
+
+    // GAP: launcher-rs FromStr (src/api/mod.rs:68-88) splits on '.' and reads only
+    // parts[0]/parts[1], silently discarding the "3" in "1.2.3", returning
+    // Ok(Version{1,2}). Go's regex ^v?(\d+)\.?(\d*)$ REJECTS "1.2.3". The
+    // from_str("1.2.3").is_err() assertion is the Go-correct value and FAILS against
+    // launcher-rs, exposing the lenient-parse divergence. ("", "abc", "1.x" all pass.)
+    #[test]
+    fn parse_invalid_returns_err() {
+        assert!(Version::from_str("").is_err());
+        assert!(Version::from_str("abc").is_err());
+        assert!(Version::from_str("1.x").is_err());
+        assert!(Version::from_str("1.2.3").is_err());
+    }
+}
