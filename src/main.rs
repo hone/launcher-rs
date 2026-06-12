@@ -15,7 +15,9 @@ pub mod exit;
 pub mod launch;
 pub mod shell;
 
-use env::{ActionType, LaunchEnv};
+use crate::env::{
+    add_implicit_layer_dir_paths, apply_env_dir_modifications, sanitize_env_vars_for_launch,
+};
 use exit::ExitCode;
 use launch::RawMetadata;
 #[cfg(unix)]
@@ -23,6 +25,8 @@ use shell::BashShell;
 #[cfg(windows)]
 use shell::CmdShell;
 use shell::{Shell, ShellProcess};
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -111,9 +115,6 @@ pub enum LaunchError {
         /// The inner verification error.
         error: api::buildpack::BuildpackApiError,
     },
-    /// Error building the launch environment.
-    #[error("failed to launch: {0}")]
-    LaunchEnv(Box<env::LaunchEnvError>),
     /// Error executing an `exec.d` initialization script.
     #[error("failed to launch: {0}")]
     ExecD(Box<exec_d::ExecDError>),
@@ -161,6 +162,22 @@ pub enum LaunchError {
     ListLayerFiles {
         /// Context string describing what was being listed.
         context: String,
+        /// The underlying I/O error.
+        error: std::io::Error,
+    },
+    /// Failed to add a layer directory's implicit paths (`bin`, `lib`) to the launch env.
+    #[error("failed to launch: add layer paths from '{path}': {error}")]
+    AddLayerPaths {
+        /// The layer directory being processed.
+        path: String,
+        /// The underlying I/O error.
+        error: std::io::Error,
+    },
+    /// Failed to apply env-file modifications from a layer's env directory.
+    #[error("failed to launch: apply env dir '{path}': {error}")]
+    ApplyEnvDir {
+        /// The env directory being processed.
+        path: String,
         /// The underlying I/O error.
         error: std::io::Error,
     },
@@ -298,7 +315,10 @@ fn run_launcher() -> Result<(), LaunchError> {
     })?;
 
     // 8. Prepare Launch Environment
-    let mut env = LaunchEnv::new(std::env::vars(), CNB_PROCESS_DIR, CNB_LIFECYCLE_DIR);
+    let mut env = sanitize_env_vars_for_launch(
+        std::env::vars_os(),
+        &[CNB_PROCESS_DIR.into(), CNB_LIFECYCLE_DIR.into()],
+    );
 
     // Apply layers sequential modifications
     for bp in &metadata.buildpacks {
@@ -313,27 +333,31 @@ fn run_launcher() -> Result<(), LaunchError> {
 
         // 1. Add layer roots to path variables
         for ldir in &layer_dirs {
-            env.add_root_dir(ldir)
-                .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
+            add_implicit_layer_dir_paths(&mut env, ldir).map_err(|error| {
+                LaunchError::AddLayerPaths {
+                    path: ldir.to_string_lossy().into_owned(),
+                    error,
+                }
+            })?;
         }
 
         // 2. Add env file modifications
         for ldir in &layer_dirs {
-            // Apply <layer>/env
-            env.add_env_dir(ldir.join("env"), ActionType::Override)
-                .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
+            let paths = [
+                ldir.join("env"),
+                ldir.join("env.launch"),
+                ldir.join("env.launch").join(&resolved_process.proc_type),
+            ];
 
-            // Apply <layer>/env.launch
-            env.add_env_dir(ldir.join("env.launch"), ActionType::Override)
-                .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
-
-            // Apply <layer>/env.launch/<process>
-            if !resolved_process.proc_type.is_empty() {
-                env.add_env_dir(
-                    ldir.join("env.launch").join(&resolved_process.proc_type),
-                    ActionType::Override,
-                )
-                .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
+            for path in paths {
+                if path.is_dir() {
+                    apply_env_dir_modifications(&mut env, &path).map_err(|error| {
+                        LaunchError::ApplyEnvDir {
+                            path: path.to_string_lossy().into_owned(),
+                            error,
+                        }
+                    })?;
+                }
             }
         }
     }
@@ -414,7 +438,7 @@ fn run_launcher() -> Result<(), LaunchError> {
             args: resolved_process.args.clone(),
             caller: argv0,
             profiles,
-            env: env.vars().clone(),
+            env,
             working_directory: resolved_process.working_directory.clone(),
         };
 
@@ -503,18 +527,18 @@ fn escape_id(id: &str) -> String {
 
 /// Scans a directory for `exec.d` scripts and executes them sequentially.
 ///
-/// The environment variable outputs of each execution are merged into the launcher's environment [`LaunchEnv`].
+/// The environment variable outputs of each execution are merged into the launcher's environment.
 ///
 /// # Errors
 ///
 /// Returns [`LaunchError`] if listing the directory or running any binary fails.
-fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError> {
+fn run_exec_d_in_dir(dir: &Path, env: &mut HashMap<OsString, OsString>) -> Result<(), LaunchError> {
     let files = read_layer_files(dir, "List exec.d dir")?;
 
     for file in files {
         let res = exec_d::run_exec_d(&file, env).map_err(|e| LaunchError::ExecD(Box::new(e)))?;
         for (k, v) in res {
-            env.set(&k, &v);
+            env.insert(OsString::from(k), OsString::from(v));
         }
     }
     Ok(())

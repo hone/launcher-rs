@@ -5,8 +5,9 @@
 //! or via a shell wrapper.
 
 use crate::api::Version;
-use crate::env::LaunchEnv;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
 
@@ -246,16 +247,16 @@ impl ResolvedProcess {
     ///
     /// # Arguments
     ///
-    /// * `env` - The [`LaunchEnv`] containing environment variables to configure for the process.
+    /// * `env` - The environment variables to configure for the process.
     ///
     /// # Errors
     ///
     /// Returns [`std::io::Error`] if the command lookup, working directory switch, or process spawn fails.
     #[cfg(unix)]
-    pub fn launch_direct(&self, env: &LaunchEnv) -> Result<(), std::io::Error> {
+    pub fn launch_direct(&self, env: &HashMap<OsString, OsString>) -> Result<(), std::io::Error> {
         use std::os::unix::process::CommandExt;
 
-        let path_val = env.get("PATH").cloned().unwrap_or_default();
+        let path_val = env.get(OsStr::new("PATH")).cloned().unwrap_or_default();
 
         // Find the absolute path to the command
         let binary_path =
@@ -279,7 +280,7 @@ impl ResolvedProcess {
         let mut cmd = Command::new(binary_path);
         cmd.args(&self.args);
         cmd.env_clear();
-        cmd.envs(env.vars());
+        cmd.envs(env);
 
         let err = cmd.exec();
         Err(err)
@@ -290,14 +291,14 @@ impl ResolvedProcess {
     ///
     /// # Arguments
     ///
-    /// * `env` - The [`LaunchEnv`] containing environment variables to configure for the process.
+    /// * `env` - The environment variables to configure for the process.
     ///
     /// # Errors
     ///
     /// Returns [`std::io::Error`] if the command lookup, working directory switch, or process spawn fails.
     #[cfg(windows)]
-    pub fn launch_direct(&self, env: &LaunchEnv) -> Result<(), std::io::Error> {
-        let path_val = env.get("PATH").cloned().unwrap_or_default();
+    pub fn launch_direct(&self, env: &HashMap<OsString, OsString>) -> Result<(), std::io::Error> {
+        let path_val = env.get(OsStr::new("PATH")).cloned().unwrap_or_default();
 
         // Find the absolute path to the command
         let binary_path =
@@ -321,7 +322,7 @@ impl ResolvedProcess {
         let mut cmd = Command::new(binary_path);
         cmd.args(&self.args);
         cmd.env_clear();
-        cmd.envs(env.vars());
+        cmd.envs(env);
 
         let mut child = cmd.spawn()?;
         let status = child.wait()?;
